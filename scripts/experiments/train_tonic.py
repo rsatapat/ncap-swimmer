@@ -3,9 +3,19 @@ Train agent using algorithms from Tonic.
 """
 import argparse
 import os
+import sys
+
+# Add repo directories to Python's path, resolved relative to this file (repo/scripts/experiments/).
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, os.path.join(REPO_ROOT, 'garage', 'src'))
+sys.path.insert(0, os.path.join(REPO_ROOT, 'scripts'))
 
 import tonic
 import tonic.torch
+
+from garage.envs.dm_control import DMControlEnv
+from dm_control import suite
 
 # Register custom environments.
 import neurobo.ncap.envs
@@ -62,7 +72,6 @@ def train(
     agent=agent,
     environment=environment,
     test_environment=test_environment,
-    seed=seed,
   )
 
   # Run some code before training.

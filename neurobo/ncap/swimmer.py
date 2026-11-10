@@ -276,7 +276,7 @@ class SwimmerPolicy(Policy):
     self,
     env_spec,
     n_joints,
-    use_task=None,  # None, 'hardcoded', 'learned'
+    use_task='learned',  # None, 'hardcoded', 'learned'
     speed_sensor_range=0.12,
     turn_sensor_range=0.1,
     name='SwimmerPolicy',
@@ -306,10 +306,9 @@ class SwimmerPolicy(Policy):
     Returns:
       (torch.Tensor): Batch of actions, shape (N, action_dim).
     """
-    # observation_dim =
-    #   n_joints ['joints'] +
-    #   2 ['to_target'] +
-    #   3 * (n_joints + 1) ['body_velocities']
+    # Navigate.get_observation's OrderedDict is flattened in insertion order:
+    # 'joints', 'body_velocities', 'head_orientation', 'to_target' -- so 'to_target'
+    # is the LAST 2 values, not the 2 right after 'joints'.
     # action_dim = n_joints
 
     # Normalize by max joint angle (in radians).
@@ -318,7 +317,7 @@ class SwimmerPolicy(Policy):
     joint_pos = torch.clamp(joint_pos / joint_limit, min=-1, max=1)
 
     if self.use_task == 'hardcoded':
-      to_target = observations[..., self.n_joints:(self.n_joints + 2)]  # shape (N, 2)
+      to_target = observations[..., -2:]  # shape (N, 2)
       x = to_target[..., 0, None].neg()
       y = to_target[..., 1, None]
       # Transform x-coord into values in [0, 1], 0 no turn (target near), 1 max turn (target far).
@@ -327,7 +326,7 @@ class SwimmerPolicy(Policy):
       # Transform y-coord into value in [0, 1], 0 slow (target near), 1 fast (target far).
       speed_control = (y.abs() > self.speed_sensor_range).float()
     elif self.use_task == 'learned':
-      to_target = observations[..., self.n_joints:(self.n_joints + 2)]  # shape (N, 2)
+      to_target = observations[..., -2:]  # shape (N, 2)
       x = to_target[..., 0, None].neg()
       y = to_target[..., 1, None]
       # Pass task features through task_module to get control signals.
@@ -378,6 +377,7 @@ class SwimmerPolicy(Policy):
   def reset(self, do_resets=None):
     """Resets the policy."""
     self.module.reset()
+
 
 class SwimmerActor(nn.Module):
   def __init__(

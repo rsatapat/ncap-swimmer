@@ -1,6 +1,15 @@
 """
 Train swimmer body using ES algorithm (from ESTorch).
 """
+import sys
+import os
+
+# Add repo directories to Python's path, resolved relative to this file (repo/scripts/experiments/).
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, os.path.join(REPO_ROOT, 'garage', 'src'))
+sys.path.insert(0, os.path.join(REPO_ROOT, 'scripts'))
+
 import click
 import os
 import sys
@@ -12,14 +21,16 @@ from mpi4py import MPI
 from dowel import logger, tabular
 from dm_control import suite
 from acme import wrappers
+import datetime
+
 from garage import wrap_experiment, rollout
-from garage.envs.dm_control import DMControlEnv
+from garage.envs.dm_control import DMControlEnv #An adapter that wraps a dm_control environment so Garage can use it.
 from garage.experiment import deterministic
 from garage.experiment.snapshotter import Snapshotter
 
 from garage.torch.policies import GaussianMLPPolicy
 from neurobo.ncap.swimmer import SwimmerPolicy
-import neurobo.ncap.envs
+import neurobo.ncap.envs # this basically runs the code in envs.py to register the tasks with the dm_control suite
 import estorch
 
 
@@ -37,13 +48,27 @@ import estorch
 @click.option('--policy', default='mlp', type=click.Choice(['mlp', 'ncap']), help='Policy network architecture.')
 @click.option('--policy_hidden_sizes', default='64,64', help='Policy network hidden layers sizes.')
 @click.option('--ncap_opts', default='111', help='Bit string for NCAP options [ws, sign, mag].')
+@click.option('--include_speed_control', is_flag=True, default=False,
+  help="Let task_module's speed_control output actually reach the CPG. Only matters when --policy=ncap and --task=navigate with use_task='learned'.")
+@click.option('--include_turn_control', is_flag=True, default=False,
+  help="Let task_module's right/left turn_control output actually reach the CPG. Only matters when --policy=ncap and --task=navigate with use_task='learned'.")
 @click.option('--osc_period', default=60, help='Swimmer oscilator period.')
+@click.option('--curriculum', default='epoch',
+  type=click.Choice(['epoch', 'value_gated', 'value_free', 'dist_only', 'dir_only', 'dist_and_dir']),
+  help="Navigate.get_reward's w_speed/w_dir/w_dist schedule: 'epoch' (time-based), "
+       "'value_gated' (performance-based, speed->dir->dist order enforced), "
+       "'value_free' (performance-based, no ordering), or fixed-weight baselines with "
+       "no curriculum at all -- 'dist_only', 'dir_only', 'dist_and_dir' (w_dir=w_dist=0.5). "
+       "Only matters for --task=navigate.")
 @click.option('--seed', default=1, help='Random seed.')
 @wrap_experiment(
   prefix='experiments/swimmer/swimmer_es',
-  name_parameters='passed',
+  name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+  name_parameters=None,
   snapshot_mode='gap_and_last',
   snapshot_gap=5,
+  # Every MPI process runs this decorator, so concurrent repo archiving races with logs being written to data/.
+  archive_launch_repo=False,
 )
 def swimmer_es(
   ctxt,
@@ -60,7 +85,10 @@ def swimmer_es(
   policy,
   policy_hidden_sizes,
   ncap_opts,
+  include_speed_control,
+  include_turn_control,
   osc_period,
+  curriculum,
   seed,
 ):
   assert population_size % n_proc == 0 and population_size % 2 == 0
@@ -73,7 +101,12 @@ def swimmer_es(
   seed = 1000 * seed + rank  # Worker-specific seed based on task id.
   deterministic.set_seed(seed)
 
-  env = DMControlEnv(suite.load('swimmer', task, task_kwargs={'random': seed}))
+  # swim() has no 'curriculum' parameter, so only pass it for navigate.
+  task_kwargs = dict(random=seed)
+  if task == 'navigate':
+    task_kwargs['curriculum'] = curriculum
+
+  env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs)) #this loads the task from envs.py
 
   assert policy in ('mlp', 'ncap')
   if policy == 'mlp':
@@ -92,10 +125,13 @@ def swimmer_es(
       env_spec=env.spec,
       n_joints=env.spec.action_space.shape[0],
       oscillator_period=osc_period,
-      use_task=None,
+      # swim has no target in its observation, so task_module must not run for it.
+      use_task='learned' if task == 'navigate' else None,  # None, 'hardcoded', 'learned'
       use_weight_sharing=sharing,
       use_weight_constraints=constraints,
       use_weight_constant_init=constant_init,
+      include_speed_control=include_speed_control,
+      include_turn_control=include_turn_control,
     )
 
   assert optim in ('adam', 'sgd')
@@ -107,14 +143,78 @@ def swimmer_es(
   class Agent():
     def __init__(self, device=torch.device('cpu')):
       self.device = device
-      self.env = DMControlEnv(suite.load('swimmer', task, task_kwargs={'random': seed}))
+      self.env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs))
+
+    def set_current_epoch(self, epoch: int):
+      """Helper method to update current epoch from training loop."""
+      self.env._env.task.set_epoch(epoch)
+
+    def get_curriculum_ema(self):
+      """(ema_speed, ema_dir, ema_dist), or None for tasks without a
+      curriculum (e.g. swim). For broadcasting master's state to workers."""
+      task = self.env._env.task
+      return task.get_curriculum_ema() if hasattr(task, 'get_curriculum_ema') else None
+
+    def set_curriculum_ema(self, ema_state):
+      """Overwrite this process's running averages, e.g. on a worker
+      receiving master's broadcast. No-op if ema_state is None."""
+      if ema_state is not None:
+        self.env._env.task.set_curriculum_ema(ema_state)
+
+    def update_curriculum_ema(self):
+      """Feed the most recent rollout()'s sub-reward averages into the
+      task's curriculum EMA. Call this exactly once per epoch, right after
+      rollout()'ing the just weight-updated policy -- not after any
+      exploratory ES candidate -- so the EMA reflects a clean measurement of
+      the actual trained policy, not noisy perturbations around it."""
+      task = self.env._env.task
+      if hasattr(task, 'update_curriculum_ema'):
+        task.update_curriculum_ema(
+          self.last_speed_reward, self.last_dir_reward, self.last_dist_reward)
 
     def rollout(self, policy):
       total_reward = 0.
+      all_target_distances = []
+      all_velocities = []
+      all_speed_rewards = []
+      all_dir_rewards = []
+      all_dist_rewards = []
       for _ in range(n_evals):
         data = rollout(self.env, policy, deterministic=True)
         total_reward += sum(data['rewards'])
-      return total_reward / n_evals
+
+        # Only the navigate task observes 'to_target'; swim has no target.
+        # Use only the final timestep's distance (how close it ended up), not every
+        # timestep of the episode (which would measure typical distance while
+        # swimming, not navigation accuracy).
+        if 'to_target' in data['env_infos']:
+          final_to_target = data['env_infos']['to_target'][-1]
+          all_target_distances.append(np.linalg.norm(final_to_target))
+
+        # Mean speed within this episode, one value per episode (like
+        # all_target_distances above), so a longer episode doesn't get more
+        # weight than a shorter one when aggregated across n_evals below.
+        all_velocities.append(np.mean(-data['env_infos']['body_velocities'][:, 1]))
+
+        # This episode's sub-reward history, for update_curriculum_ema() --
+        # only present for tasks with a curriculum (navigate), not swim.
+        task = self.env._env.task
+        if hasattr(task, '_episode_speed_rewards'):
+          all_speed_rewards.append(np.mean(task._episode_speed_rewards))
+          all_dir_rewards.append(np.mean(task._episode_dir_rewards))
+          all_dist_rewards.append(np.mean(task._episode_dist_rewards))
+
+      mean_distance = np.median(all_target_distances) if all_target_distances else np.nan
+      mean_velocity = np.median(all_velocities)
+
+      # Stashed on self (not returned) so update_curriculum_ema() can use
+      # them without changing this method's return signature.
+      if all_speed_rewards:
+        self.last_speed_reward = np.median(all_speed_rewards)
+        self.last_dir_reward = np.median(all_dir_rewards)
+        self.last_dist_reward = np.median(all_dist_rewards)
+
+      return total_reward / n_evals, mean_distance, mean_velocity
 
   start_time = time.time()
   epoch_time = time.time()
@@ -133,6 +233,7 @@ def swimmer_es(
       logger.log(f'EpochTime {now - epoch_time:.2f} s')
       epoch_time = now
       epoch = self.step + 1
+      print(self.current_epoch, epoch, self.step)
 
       tabular.record('Epoch', epoch)
       tabular.record('TotalEnvSteps', epoch * population_size * n_evals * env.spec.max_episode_length)
@@ -140,10 +241,24 @@ def swimmer_es(
       tabular.record('PopulationAvgReturn', np.mean(self.population_returns))
       tabular.record('PopulationMinReturn', np.min(self.population_returns))
       tabular.record('PopulationMaxReturn', np.max(self.population_returns))
+      tabular.record('DistanceFromTarget', self.other_rewards['mean_distance'])
+      tabular.record('MeanVelocity', self.other_rewards['mean_velocity'])
       logger.log(tabular)
 
       logger.dump_all(epoch)
       tabular.clear()
+
+      # Raw per-candidate returns for this epoch (population_size values), so the
+      # full distribution can be inspected later -- progress.csv only keeps the
+      # min/avg/max summary, which hides e.g. bimodal "some candidates totally
+      # broken, some fine" population structure.
+      pop_returns_path = os.path.join(ctxt.snapshot_dir, 'population_returns.csv')
+      write_header = not os.path.isfile(pop_returns_path)
+      with open(pop_returns_path, 'a') as f:
+        if write_header:
+          f.write('Epoch,Return\n')
+        for r in self.population_returns.flatten():
+          f.write(f'{epoch},{r}\n')
 
       snapshotter.save_itr_params(
         epoch,
@@ -166,6 +281,42 @@ def swimmer_es(
     agent_kwargs=dict(),
     optimizer_kwargs=dict(lr=lr, weight_decay=l2_coeff),
   )
+
+  # --- one-off warm start from an old checkpoint ---
+  WARM_START = False  # <- set to True to resume from WARM_START_PATH below
+  if rank == 0 and WARM_START:
+    import io, pickle, re, glob
+
+    class CPU_Unpickler(pickle.Unpickler):
+      def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+          return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        return super().find_class(module, name)
+
+    WARM_START_PATH = r'/home/vatsala/sroshan/ncap-swimmer/data/local/experiments/swimmer/swimmer_es/2026-11-06_10-38-56_12/itr_140.pkl'  # <- edit this path
+    with open(WARM_START_PATH, 'rb') as f:
+      ckpt = CPU_Unpickler(f).load()
+    es.policy.load_state_dict(ckpt['best_policy_dict'])  # use ckpt['policy_dict'] for the last (not best) weights instead
+    es.best_policy_dict = ckpt['best_policy_dict']
+    es.best_reward = -float('inf')  # so logging still improves monotonically from here
+
+    # Resume the reward decay schedule (self.current_epoch) from where the old run left off.
+    warm_start_dir = os.path.dirname(WARM_START_PATH)
+    match = re.search(r'itr_(\d+)\.pkl$', os.path.basename(WARM_START_PATH))
+    if match:
+      epoch_offset = int(match.group(1))
+    else:
+      itr_files = glob.glob(os.path.join(warm_start_dir, 'itr_*.pkl'))
+      itr_nums = [int(re.search(r'itr_(\d+)\.pkl$', f).group(1)) for f in itr_files]
+      if itr_nums:
+        epoch_offset = max(itr_nums)
+      else:
+        import pandas as pd
+        epoch_offset = int(pd.read_csv(os.path.join(warm_start_dir, 'progress.csv'))['Epoch'].max())
+    es.current_epoch = epoch_offset
+
+    print(f'Warm-started policy from {WARM_START_PATH}, current_epoch set to {epoch_offset}')
+  # --- end warm start ---
 
   if rank == 0 and os.getenv('MPI_PARENT') is not None:
     # Manager process is only one that logs.

@@ -138,6 +138,7 @@ class ES():
 
         self.status = MPI.Status()
         self._trained = False
+        self.current_epoch = 0  # Initialize current_epoch to 0
 
     def terminate(self):
         """Terminates the training and sends terminate signal to other processes."""
@@ -170,7 +171,14 @@ class ES():
         return grad
 
     def _after_optimize(self, policy):
-        self.episode_reward = self.agent.rollout(policy)
+        self.episode_reward, mean_distance, mean_velocity = self.agent.rollout(policy)
+        self.other_rewards = {'mean_distance': mean_distance, 'mean_velocity': mean_velocity}
+        # This rollout is the one clean, deterministic evaluation of the
+        # just-updated policy -- the only point where it's safe to update a
+        # curriculum's running averages without mixing in noisy exploratory
+        # ES candidates (see _calculate_returns, which never calls this).
+        if hasattr(self.agent, 'update_curriculum_ema'):
+            self.agent.update_curriculum_ema()
         if self.episode_reward > self.best_reward:
             self.best_reward = self.episode_reward
             self.best_policy_dict = copy.deepcopy(policy.state_dict())
@@ -188,7 +196,7 @@ class ES():
         for parameter in parameters:
             torch.nn.utils.vector_to_parameters(
                 parameter.to(self.device), self.target.parameters())
-            reward = self.agent.rollout(self.target)
+            reward, _, _ = self.agent.rollout(self.target)
             returns.append(reward)
         return np.array(returns, dtype=np.float32)[:, np.newaxis]
 
@@ -203,6 +211,8 @@ class ES():
         self.step = 0
         with torch.no_grad():
             while self.step < self.n_steps and not self._stop:
+                self.current_epoch += 1
+                self.agent.set_current_epoch(self.current_epoch)
                 policy, optimizer = self._get_policy()
                 self.population_parameters, epsilon = self._sample_policy(policy)
                 n_parameters_per_worker = int(self.population_size/self.n_workers)
@@ -235,6 +245,13 @@ class ES():
                     index += size
                 optimizer.step()
                 self._after_optimize(policy)
+                # Broadcast this epoch's curriculum state (just updated by
+                # _after_optimize, above, from master's own policy evaluation
+                # -- see _after_optimize for why only master can compute this)
+                # to every worker, so all of them score next epoch's
+                # candidates with the same weighting.
+                ema_state = self.agent.get_curriculum_ema() if hasattr(self.agent, 'get_curriculum_ema') else None
+                self._comm.bcast(ema_state, root=0)
                 self.log()
                 self.step += 1
         for worker_idx in range(1, self.n_workers):
@@ -256,8 +273,21 @@ class ES():
                 parameters = self._recv_from_master()
                 if parameters is None:
                     break
+                # Mirrors _master()'s per-epoch increment. The blocking Recv above
+                # keeps this loop in lockstep with _master()'s loop (one iteration
+                # here per one epoch there), so counting independently here stays
+                # in sync without needing an explicit broadcast.
+                self.current_epoch += 1
+                self.agent.set_current_epoch(self.current_epoch)
                 returns = self._calculate_returns(parameters)
                 self._comm.Send(returns, dest=0)
+                # Matching counterpart to _master()'s bcast after _after_optimize --
+                # unlike current_epoch, this can't be computed independently here
+                # (it depends on master's own policy evaluation), so it has to
+                # actually be received, not just mirrored.
+                ema_state = self._comm.bcast(None, root=0)
+                if hasattr(self.agent, 'set_curriculum_ema'):
+                    self.agent.set_curriculum_ema(ema_state)
             sys.exit(0)
 
     def train(self, n_steps, n_proc=1, hwthread=False, hostfile=None):
