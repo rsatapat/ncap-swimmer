@@ -1,0 +1,12 @@
+# Ignore everything by default...
+*
+
+# ...except directories (so git can still traverse into them to find
+# the files allowed below)...
+!*/
+
+# ...and these file types.
+!*.py
+!*.ipynb
+!*.md
+!/.gitignore
