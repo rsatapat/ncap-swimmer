@@ -110,14 +110,18 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
             break
 
     trajectory = np.array(trajectory)
+    # Resolve the actual target used, even when the caller left it to the
+    # task's own default (target=None) -- read back from the task itself
+    # rather than trusting the possibly-None argument.
+    resolved_target = tuple(env._env.task._target_pos) if task == 'navigate' else None
     final_distance = (
-        float(np.linalg.norm(np.array(target) - trajectory[-1]))
-        if task == 'navigate' and target is not None else None
+        float(np.linalg.norm(np.array(resolved_target) - trajectory[-1]))
+        if resolved_target is not None else None
     )
 
     return {
         'seed': seed,
-        'target': target,
+        'target': resolved_target,
         'total_reward': float(np.sum(rewards)),
         'mean_reward': float(np.mean(rewards)),
         'mean_velocity': float(np.mean(velocities)),
@@ -176,6 +180,45 @@ def run_sweep(policy, task, seeds, targets, max_steps=300, out_csv=None):
     return results
 
 
+def run_checkpoints(run_dir, itrs, seed=1, max_steps=300, out_csv=None):
+    """Roll out several itr_N.pkl checkpoints from the same run, on the same
+    seed and (each checkpoint's own default) target, to see how the
+    trajectory changes over training.
+
+    Args:
+        run_dir: training run folder containing itr_<N>.pkl checkpoints.
+        itrs: list of checkpoint epoch numbers to roll out, e.g. [10, 50, 100, 200, 300].
+        seed: random seed, shared across all checkpoints so differences in
+            the trajectory reflect the policy, not a different initial heading.
+        max_steps: episode length cap for each rollout.
+        out_csv: if given, write one long-format CSV here with every step of
+            every checkpoint's rollout (itr, target, step, x, y, velocity, reward).
+
+    Returns:
+        list of dicts, one per itr (see rollout_episode()).
+    """
+    results = []
+    for itr in itrs:
+        policy, task = load_checkpoint(os.path.join(run_dir, f'itr_{itr}.pkl'))
+        result = rollout_episode(policy, task, seed=seed, target=None, max_steps=max_steps)
+        results.append(result)
+        print(f"itr={itr}: final_distance={result['final_distance']} "
+              f"mean_reward={result['mean_reward']:.4f} mean_velocity={result['mean_velocity']:.4f}")
+
+    if out_csv:
+        with open(out_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['itr', 'target', 'step', 'x', 'y', 'velocity', 'reward'])
+            for itr, r in zip(itrs, results):
+                for step, (x, y) in enumerate(r['trajectory']):
+                    velocity = r['velocities'][step - 1] if step > 0 else ''
+                    reward = r['rewards'][step - 1] if step > 0 else ''
+                    writer.writerow([itr, r['target'], step, x, y, velocity, reward])
+        print(f"Saved per-step checkpoint rollouts to {out_csv}")
+
+    return results
+
+
 def make_video(policy, task, seed, target=None, max_steps=300, out_path=None, fps=30):
     """Roll out one episode (via rollout_episode, with render=True) and save it as an mp4."""
     result = rollout_episode(policy, task, seed, target, max_steps, render=True)
@@ -191,28 +234,42 @@ if __name__ == '__main__':
         'model',
         nargs='?',
         default=os.path.join(REPO_ROOT, 'outputs', '2026-10-14_16-49-14_2', 'params.pkl'),
-        help='Path to a params.pkl snapshot.',
+        help="Path to a params.pkl snapshot (--mode video/sweep), or a training "
+             "run's folder containing itr_N.pkl checkpoints (--mode checkpoints).",
     )
     parser.add_argument(
-        '--mode', choices=['video', 'sweep'], default='video',
+        '--mode', choices=['video', 'sweep', 'checkpoints'], default='video',
         help="'video' renders one episode to an mp4. 'sweep' runs every "
              "combination of SEEDS/TARGETS (edit them at the top of this "
-             "file) and reports the results, without rendering anything.",
+             "file) and reports the results, without rendering anything. "
+             "'checkpoints' rolls out several itr_N.pkl checkpoints from one "
+             "run (--itrs) on the same seed/target, to see how the "
+             "trajectory changes over training -- writes a CSV meant to be "
+             "read (not re-run) from track_model.ipynb's "
+             "plot_trajectory_over_checkpoints, since that notebook may not "
+             "have dm_control available.",
     )
     parser.add_argument('--n_steps', type=int, default=300, help='Max steps per episode.')
+    parser.add_argument('--itrs', default='10,50,100,200,300',
+                         help='Comma-separated itr_N checkpoint numbers to roll out (--mode checkpoints only).')
     args = parser.parse_args()
 
-    print("Loading policy and weights...")
-    policy, task = load_checkpoint(args.model)
-    print(f"Policy loaded. Task inferred from variant.json: {task!r}")
-
-    if args.mode == 'video':
-        target = TARGETS[0] if task == 'navigate' else None
-        video_path = os.path.join(
-            os.path.dirname(args.model),
-            f"swimmer_result_{os.path.basename(args.model).split('.')[0]}.mp4")
-        make_video(policy, task, seed=SEEDS[0], target=target,
-                   max_steps=args.n_steps, out_path=video_path)
+    if args.mode == 'checkpoints':
+        itrs = [int(x) for x in args.itrs.split(',')]
+        out_csv = os.path.join(args.model, 'checkpoint_trajectories.csv')
+        run_checkpoints(args.model, itrs, max_steps=args.n_steps, out_csv=out_csv)
     else:
-        out_csv = os.path.join(os.path.dirname(args.model), 'sweep_results.csv')
-        run_sweep(policy, task, SEEDS, TARGETS, max_steps=args.n_steps, out_csv=out_csv)
+        print("Loading policy and weights...")
+        policy, task = load_checkpoint(args.model)
+        print(f"Policy loaded. Task inferred from variant.json: {task!r}")
+
+        if args.mode == 'video':
+            target = TARGETS[0] if task == 'navigate' else None
+            video_path = os.path.join(
+                os.path.dirname(args.model),
+                f"swimmer_result_{os.path.basename(args.model).split('.')[0]}.mp4")
+            make_video(policy, task, seed=SEEDS[0], target=target,
+                       max_steps=args.n_steps, out_path=video_path)
+        else:
+            out_csv = os.path.join(os.path.dirname(args.model), 'sweep_results.csv')
+            run_sweep(policy, task, SEEDS, TARGETS, max_steps=args.n_steps, out_csv=out_csv)

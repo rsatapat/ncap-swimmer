@@ -36,7 +36,7 @@ def swim(
 @swimmer.SUITE.add() # adds navigate task to the suite of tasks in the swimmer domain
 def navigate(
   n_links=6,
-  target_pos=(-3.0, 0.0),
+  target_pos=(-2.0, 1.0),
   desired_speed=_SWIM_SPEED,
   time_limit=swimmer._DEFAULT_TIME_LIMIT,
   random=None,
@@ -141,6 +141,36 @@ class Navigate(swimmer.Swimmer):
         self._ema_speed = 0.0
         self._ema_dir = 0.0
         self._ema_dist = 0.0
+
+        # Curriculum shape constants -- attributes (not CLI flags) so
+        # get_curriculum_params() can expose them for train_swimmer_es.py to
+        # record into curriculum_params.json per run, without bloating the
+        # CLI. Edit these directly to tune; see get_reward for how they're used.
+        self.dir_peak_epoch = 200      # 'epoch': epoch where w_dir peaks
+        self.dir_width = 100           # 'epoch': how fast w_dir rises/falls around its peak
+        self.dist_start_epoch = 250    # 'epoch': epoch around which w_dist takes over
+        self.dist_tau = 100            # 'epoch': how fast w_dist rises
+        self.speed_tau = 250           # 'epoch': how fast w_speed's priority decays
+        self.epoch_temperature = 0.5   # 'epoch': softmax temperature
+        self.value_temperature = 0.1   # 'value_gated'/'value_free': softmax temperature
+
+    def get_curriculum_params(self):
+        """Return this task's curriculum settings as a plain dict, for
+        train_swimmer_es.py to record into curriculum_params.json -- so a
+        later comparison across runs knows exactly which tuning each one
+        used, even though these aren't exposed as CLI flags.
+        """
+        return {
+            'curriculum': self.curriculum,
+            'ema_alpha': self._ema_alpha,
+            'dir_peak_epoch': self.dir_peak_epoch,
+            'dir_width': self.dir_width,
+            'dist_start_epoch': self.dist_start_epoch,
+            'dist_tau': self.dist_tau,
+            'speed_tau': self.speed_tau,
+            'epoch_temperature': self.epoch_temperature,
+            'value_temperature': self.value_temperature,
+        }
 
     def set_epoch(self, epoch: int):
         """Helper method to update current epoch from training loop."""
@@ -322,23 +352,18 @@ class Navigate(swimmer.Swimmer):
             # the swimmer first learns to move at all, w_dir peaks
             # mid-training (rise then fall) once propulsion exists, and
             # w_dist rises late and takes over for precise target-reaching.
-            dir_peak_epoch = 90       # epoch where w_dir peaks
-            dir_width = 85            # how fast w_dir rises/falls around its peak
-            dist_start_epoch = 280    # epoch around which w_dist takes over
-            dist_tau = 150            # how fast w_dist rises
-            speed_tau = 100           # how fast w_speed's priority decays
-            temperature = 0.5         # lower = sharper hand-offs, higher = more overlap
+            temperature = self.epoch_temperature  # lower = sharper hand-offs, higher = more overlap
 
-            logit_speed = -self.current_epoch / speed_tau
-            logit_dir = -0.5 * ((self.current_epoch - dir_peak_epoch) / dir_width) ** 2
-            logit_dist = (self.current_epoch - dist_start_epoch) / dist_tau
+            logit_speed = -self.current_epoch / self.speed_tau
+            logit_dir = -0.5 * ((self.current_epoch - self.dir_peak_epoch) / self.dir_width) ** 2
+            logit_dist = (self.current_epoch - self.dist_start_epoch) / self.dist_tau
 
         elif self.curriculum == 'value_gated':
             # Performance-based, with the same speed->dir->dist ordering as
             # 'epoch' enforced explicitly: dir's priority only rises once
             # speed is mastered (gated by self._ema_speed), and dist's only
             # rises once both speed and dir are mastered.
-            temperature = 0.1
+            temperature = self.value_temperature
             logit_speed = 1 - self._ema_speed
             logit_dir = (1 - self._ema_dir) * self._ema_speed
             logit_dist = (1 - self._ema_dist) * self._ema_dir * self._ema_speed
@@ -348,7 +373,7 @@ class Navigate(swimmer.Swimmer):
             # how far it is from being mastered, independent of the others --
             # whichever objective currently has the most room to improve
             # gets the most weight, even if that's dist before speed/dir.
-            temperature = 0.1
+            temperature = self.value_temperature
             logit_speed = 1 - self._ema_speed
             logit_dir = 1 - self._ema_dir
             logit_dist = 1 - self._ema_dist

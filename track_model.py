@@ -246,6 +246,26 @@ def _class_name(cls):
     return f'{module}.{qualname}' if module else qualname
 
 
+def load_curriculum_params(run_dir):
+    """Load a run's curriculum_params.json, written once at training startup
+    by train_swimmer_es.py from Navigate.get_curriculum_params() -- the
+    curriculum constants (dir_width, dist_tau, etc.) that aren't exposed as
+    CLI flags, so aren't in variant.json.
+
+    Args:
+        run_dir: folder containing curriculum_params.json.
+
+    Returns:
+        dict of curriculum settings, or None if this run predates this
+        logging (e.g. a swim run, or an older navigate run).
+    """
+    path = os.path.join(run_dir, 'curriculum_params.json')
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def get_final_weights(run_dir):
     """Load the end-of-training policy weights from a run's params.pkl.
 
@@ -296,6 +316,7 @@ def extract_run_info(run_dir):
             'best': _state_dict_to_json(data['best_policy_dict']),
             'last': _state_dict_to_json(data['policy_dict']),
         },
+        'curriculum_params': load_curriculum_params(run_dir),
         'warnings': [],
     }
 
@@ -338,6 +359,17 @@ def format_run_summary(info):
                 f"n_evals={n_evals}  steps/eval={steps_per_eval}")
 
     lines = [header, settings]
+
+    params = info.get('curriculum_params')
+    if params:
+        if curriculum == 'epoch':
+            lines.append(
+                f"speed_tau={params['speed_tau']}  dir_peak={params['dir_peak_epoch']}  "
+                f"dir_width={params['dir_width']}  dist_start={params['dist_start_epoch']}  "
+                f"dist_tau={params['dist_tau']}  T={params['epoch_temperature']}")
+        elif curriculum in ('value_gated', 'value_free'):
+            lines.append(f"ema_alpha={params['ema_alpha']}  T={params['value_temperature']}")
+
     if task == 'navigate' and not use_task:
         lines.append('⚠ no target info (use_task=None)')
     return '\n'.join(lines)
@@ -503,21 +535,22 @@ def plot_sweep_final_distance(csv_path_or_df, save=True, save_dir='.'):
     return fig, ax, summary
 
 
-def softmax_reward_weights(epochs, n_epochs, speed_tau, dir_width, dist_start_epoch, dist_tau,
-                            temperature=0.5):
+def softmax_reward_weights(epochs, n_epochs, speed_tau, dir_peak_epoch, dir_width,
+                            dist_start_epoch, dist_tau, temperature=0.5):
     """Compute (w_speed, w_dir, w_dist) for the softmax-normalized reward
     schedule proposed for Navigate.get_reward: three epoch-dependent
     "priority" logits (speed decaying, direction peaking midway, distance
     rising) passed through a softmax, so the three weights always sum to 1.
 
-    dir's peak is placed at a fixed fraction of n_epochs (0.3, matching the
-    original 90/300 tuning), so it still rescales with training length; the
-    other three time constants are independent dials.
+    Matches Navigate.get_reward's 'epoch' curriculum exactly -- dir_peak_epoch
+    is an independent dial here too (not derived from n_epochs), same as the
+    actual self.dir_peak_epoch attribute it's tuned against.
 
     Args:
         epochs: array of epoch values to evaluate at.
-        n_epochs: total epochs training will run for (sets where dir peaks).
+        n_epochs: total epochs training will run for.
         speed_tau: time constant for speed's decay.
+        dir_peak_epoch: epoch where direction's priority peaks.
         dir_width: how fast direction's bump rises/falls around its peak.
         dist_start_epoch: epoch around which distance's priority takes over.
         dist_tau: time constant for distance's rise.
@@ -529,7 +562,6 @@ def softmax_reward_weights(epochs, n_epochs, speed_tau, dir_width, dist_start_ep
         (w_speed, w_dir, w_dist), each an array the same shape as epochs.
     """
     epochs = np.asarray(epochs, dtype=float)
-    dir_peak_epoch = 0.3 * n_epochs
 
     logit_speed = -epochs / speed_tau
     logit_dir = -0.5 * ((epochs - dir_peak_epoch) / dir_width) ** 2
@@ -542,7 +574,7 @@ def softmax_reward_weights(epochs, n_epochs, speed_tau, dir_width, dist_start_ep
     return weights[0], weights[1], weights[2]
 
 
-def plot_reward_weight_schedule(n_epochs=300, speed_tau=40, dir_width=40,
+def plot_reward_weight_schedule(n_epochs=300, speed_tau=40, dir_peak_epoch=90, dir_width=40,
                                  dist_start_epoch=160, dist_tau=60, temperature=0.5):
     """Plot w_speed/w_dir/w_dist vs epoch for the softmax reward schedule.
 
@@ -551,8 +583,9 @@ def plot_reward_weight_schedule(n_epochs=300, speed_tau=40, dir_width=40,
     Navigate.get_reward.
 
     Args:
-        n_epochs: total epochs (sets where dir peaks, at 0.3 * n_epochs).
+        n_epochs: total epochs training will run for.
         speed_tau: time constant for speed's decay.
+        dir_peak_epoch: epoch where direction's priority peaks.
         dir_width: how fast direction's bump rises/falls around its peak.
         dist_start_epoch: epoch around which distance's priority takes over.
         dist_tau: time constant for distance's rise.
@@ -565,7 +598,7 @@ def plot_reward_weight_schedule(n_epochs=300, speed_tau=40, dir_width=40,
     """
     epochs = np.arange(0, n_epochs + 1)
     w_speed, w_dir, w_dist = softmax_reward_weights(
-        epochs, n_epochs, speed_tau, dir_width, dist_start_epoch, dist_tau, temperature)
+        epochs, n_epochs, speed_tau, dir_peak_epoch, dir_width, dist_start_epoch, dist_tau, temperature)
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(epochs, w_speed, label='w_speed')
@@ -575,10 +608,119 @@ def plot_reward_weight_schedule(n_epochs=300, speed_tau=40, dir_width=40,
     ax.set_ylabel('Weight')
     ax.set_ylim(-0.05, 1.05)
     ax.set_title(f'Reward weight schedule (n_epochs={n_epochs}, speed_tau={speed_tau}, '
-                 f'dir_width={dir_width}, dist_start_epoch={dist_start_epoch}, dist_tau={dist_tau}, '
-                 f'temperature={temperature})')
+                 f'dir_peak_epoch={dir_peak_epoch}, dir_width={dir_width}, '
+                 f'dist_start_epoch={dist_start_epoch}, dist_tau={dist_tau}, temperature={temperature})')
     ax.legend(fontsize=8)
     fig.tight_layout()
     plt.show()
 
     return fig, ax
+
+
+def load_checkpoint_trajectories(csv_path):
+    """Load play.py's run_checkpoints() output: a long-format CSV with one
+    row per step of every checkpoint's rollout (columns: itr, target, step,
+    x, y, velocity, reward).
+
+    Args:
+        csv_path: path to the checkpoint_trajectories.csv written by
+            `python play.py <run_dir> --mode checkpoints`.
+
+    Returns:
+        DataFrame with 'target' parsed back into an (x, y) tuple.
+    """
+    df = pd.read_csv(csv_path)
+    df['target'] = df['target'].apply(_parse_target)
+    return df
+
+
+def plot_trajectory_over_checkpoints(csv_path_or_df, save=True, save_dir='.'):
+    """Plot how a navigate policy's trajectory changes over training, from
+    play.py's --mode checkpoints CSV (one row per step of each itr_N.pkl
+    checkpoint's rollout, all on the same seed/target).
+
+    This only reads a CSV -- generate it first by running, in an
+    environment with dm_control installed (e.g. WSL or the training server,
+    not necessarily wherever this notebook's kernel runs):
+        python play.py <run_dir> --mode checkpoints --itrs 10,50,100,200,300
+
+    Args:
+        csv_path_or_df: path to that CSV, or an already-loaded DataFrame
+            from load_checkpoint_trajectories().
+        save: if True, save the figure as an SVG.
+        save_dir: directory to save the figure in.
+
+    Returns:
+        (fig, ax, df)
+    """
+    df = (load_checkpoint_trajectories(csv_path_or_df)
+          if isinstance(csv_path_or_df, str) else csv_path_or_df)
+
+    itrs = sorted(df['itr'].unique())
+    cmap = plt.get_cmap('viridis')
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for i, itr in enumerate(itrs):
+        color = cmap(i / max(1, len(itrs) - 1))
+        run = df[df['itr'] == itr]
+        ax.plot(run['x'], run['y'], color=color, label=f'itr {itr}')
+
+    target = df['target'].dropna().iloc[0] if df['target'].notna().any() else None
+    if target is not None:
+        ax.scatter(*target, color='red', marker='*', s=150, edgecolor='black', zorder=5, label='target')
+    ax.scatter(0, 0, color='black', marker='o', s=40, zorder=5, label='start')
+
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_aspect('equal')
+    ax.legend(fontsize=8)
+    if isinstance(csv_path_or_df, str):
+        run_name = os.path.basename(os.path.dirname(os.path.abspath(csv_path_or_df)))
+    else:
+        run_name = ''
+    ax.set_title(f'Trajectory over training — {run_name}')
+    fig.tight_layout()
+
+    if save:
+        fig.savefig(os.path.join(save_dir, f'trajectory_over_checkpoints_{run_name}.svg'), dpi=300)
+
+    return fig, ax, df
+
+
+# --- Example usage -----------------------------------------------------
+#
+# play.py --mode sweep/checkpoints need dm_control, so run them in WSL/on
+# the training server, not necessarily wherever this notebook's kernel runs.
+# Each writes a CSV once; the plotting functions below just read it, so they
+# can be re-run (in a plain notebook kernel, no dm_control needed) as often
+# as you like without re-simulating anything.
+#
+# --- seed/target sweep (varies seed & target, fixed checkpoint) ---
+#   python play.py <run_dir>/params.pkl --mode sweep
+#
+#   sweep_csv = os.path.join(run_dir, 'sweep_results.csv')
+#   plot_sweep_trajectories(sweep_csv, save_dir=r'D:\ncap-swimmer')
+#   plot_sweep_timeseries(sweep_csv, save_dir=r'D:\ncap-swimmer')
+#   plot_sweep_final_distance(sweep_csv, save_dir=r'D:\ncap-swimmer')  # navigate only
+#
+# --- checkpoint comparison (varies checkpoint, fixed seed & target) ---
+#   python play.py <run_dir> --mode checkpoints --itrs 10,50,100,200,300
+#
+#   checkpoint_csv = os.path.join(run_dir, 'checkpoint_trajectories.csv')
+#   plot_trajectory_over_checkpoints(checkpoint_csv, save_dir=r'D:\ncap-swimmer')
+#
+# --- training progress (from progress.csv, no play.py needed) ---
+#   run_info = extract_run_info(run_dir)
+#   plot_training_progress(os.path.join(run_dir, 'progress.csv'), run_info=run_info,
+#                           save_dir=r'D:\ncap-swimmer')
+#   plot_population_returns(run_dir, save_dir=r'D:\ncap-swimmer')
+#
+# --- reward weight schedule explorer (no run data needed) ---
+#   widgets.interact(
+#       plot_reward_weight_schedule,
+#       n_epochs=widgets.IntSlider(min=50, max=600, step=10, value=300),
+#       speed_tau=widgets.IntSlider(min=5, max=150, step=5, value=40),
+#       dir_width=widgets.IntSlider(min=5, max=150, step=5, value=40),
+#       dist_start_epoch=widgets.IntSlider(min=0, max=600, step=10, value=160),
+#       dist_tau=widgets.IntSlider(min=5, max=150, step=5, value=60),
+#       temperature=widgets.FloatSlider(min=0.1, max=2.0, step=0.1, value=0.5),
+#   )

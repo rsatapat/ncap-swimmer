@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import shutil
+import json
 import torch
 import numpy as np
 from mpi4py import MPI
@@ -321,6 +322,14 @@ def swimmer_es(
   if rank == 0 and os.getenv('MPI_PARENT') is not None:
     # Manager process is only one that logs.
     logger.log(f'Training started for {n_epochs} epochs on worker {rank} of {size} ...')
+
+    # Record the curriculum's actual tuning constants for this run (not
+    # exposed as CLI flags, so not already in variant.json) -- lets later
+    # runs be compared against exactly what each one used.
+    task_obj = env._env.task
+    if hasattr(task_obj, 'get_curriculum_params'):
+      with open(os.path.join(ctxt.snapshot_dir, 'curriculum_params.json'), 'w') as f:
+        json.dump(task_obj.get_curriculum_params(), f, indent=2)
   elif n_proc > 1:
     # Worker processes shouldn't have a log dir.
     shutil.rmtree(ctxt.snapshot_dir)
