@@ -10,3 +10,11 @@
 !*.ipynb
 !*.md
 !/.gitignore
+
+# ...except build/packaging artifacts -- these are derived copies (e.g.
+# setup.py build copies package .py files into build/lib/...), not source,
+# so re-ignore them even though they'd otherwise match *.py above.
+build/
+dist/
+*.egg-info/
+__pycache__/
