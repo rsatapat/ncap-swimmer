@@ -444,7 +444,11 @@ def plot_sweep_trajectories(csv_path_or_df, save=True, save_dir='.'):
     ax.scatter(0, 0, color='black', marker='o', s=40, zorder=5)
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    ax.set_aspect('equal')
+    # adjustable='datalim' (not the default 'box') keeps the subplot box itself
+    # a normal shape and pads the data limits instead -- otherwise a lopsided
+    # trajectory (e.g. far in x, barely moving in y) shrinks the box into a
+    # thin strip, crowding the title/legend into almost no space.
+    ax.set_aspect('equal', adjustable='datalim')
     ax.set_title('Sweep trajectories')
     fig.tight_layout()
 
@@ -623,7 +627,7 @@ def load_checkpoint_trajectories(csv_path):
     x, y, velocity, reward).
 
     Args:
-        csv_path: path to the checkpoint_trajectories.csv written by
+        csv_path: path to the checkpoint_trajectories_<itrs>.csv written by
             `python play.py <run_dir> --mode checkpoints`.
 
     Returns:
@@ -636,13 +640,17 @@ def load_checkpoint_trajectories(csv_path):
 
 def plot_trajectory_over_checkpoints(csv_path_or_df, save=True, save_dir='.'):
     """Plot how a navigate policy's trajectory changes over training, from
-    play.py's --mode checkpoints CSV (one row per step of each itr_N.pkl
-    checkpoint's rollout, all on the same seed/target).
+    play.py's --mode checkpoints CSV (one row per step of each (itr, target)
+    rollout). One subplot per distinct target, each showing every
+    checkpoint's trajectory colored by epoch -- so with more than one
+    target, this also shows whether later checkpoints generalize to targets
+    they weren't trained on.
 
     This only reads a CSV -- generate it first by running, in an
     environment with dm_control installed (e.g. WSL or the training server,
     not necessarily wherever this notebook's kernel runs):
-        python play.py <run_dir> --mode checkpoints --itrs 10,50,100,200,300
+        python play.py <run_dir> --mode checkpoints --itrs 10,50,100,200,300 \
+            --targets='-3,0;0,2'
 
     Args:
         csv_path_or_df: path to that CSV, or an already-loaded DataFrame
@@ -651,39 +659,50 @@ def plot_trajectory_over_checkpoints(csv_path_or_df, save=True, save_dir='.'):
         save_dir: directory to save the figure in.
 
     Returns:
-        (fig, ax, df)
+        (fig, axes, df)
     """
     df = (load_checkpoint_trajectories(csv_path_or_df)
           if isinstance(csv_path_or_df, str) else csv_path_or_df)
 
     itrs = sorted(df['itr'].unique())
+    targets = sorted(df['target'].dropna().unique(), key=str) if df['target'].notna().any() else [None]
     cmap = plt.get_cmap('viridis')
-    fig, ax = plt.subplots(figsize=(6, 6))
-    for i, itr in enumerate(itrs):
-        color = cmap(i / max(1, len(itrs) - 1))
-        run = df[df['itr'] == itr]
-        ax.plot(run['x'], run['y'], color=color, label=f'itr {itr}')
 
-    target = df['target'].dropna().iloc[0] if df['target'].notna().any() else None
-    if target is not None:
-        ax.scatter(*target, color='red', marker='*', s=150, edgecolor='black', zorder=5, label='target')
-    ax.scatter(0, 0, color='black', marker='o', s=40, zorder=5, label='start')
+    fig, axes = plt.subplots(1, len(targets), figsize=(6 * len(targets), 6), squeeze=False)
+    axes = axes[0]
+    for ax, target in zip(axes, targets):
+        group = df[df['target'] == target] if target is not None else df
+        for i, itr in enumerate(itrs):
+            color = cmap(i / max(1, len(itrs) - 1))
+            run = group[group['itr'] == itr]
+            ax.plot(run['x'], run['y'], color=color, label=f'itr {itr}')
 
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    ax.set_aspect('equal')
-    ax.legend(fontsize=8)
+        if target is not None:
+            ax.scatter(*target, color='red', marker='*', s=150, edgecolor='black', zorder=5, label='target')
+        ax.scatter(0, 0, color='black', marker='o', s=40, zorder=5, label='start')
+
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        # adjustable='datalim' (not the default 'box') keeps each subplot box a
+        # normal shape and pads the data limits instead -- important here since
+        # different targets can have very different x/y spans, which would
+        # otherwise squash some subplots into thin strips and crowd their
+        # title/legend into almost no space.
+        ax.set_aspect('equal', adjustable='datalim')
+        ax.legend(fontsize=8)
+        ax.set_title(f'target {target}' if target is not None else 'trajectory')
+
     if isinstance(csv_path_or_df, str):
         run_name = os.path.basename(os.path.dirname(os.path.abspath(csv_path_or_df)))
     else:
         run_name = ''
-    ax.set_title(f'Trajectory over training — {run_name}')
+    fig.suptitle(f'Trajectory over training — {run_name}')
     fig.tight_layout()
 
     if save:
         fig.savefig(os.path.join(save_dir, f'trajectory_over_checkpoints_{run_name}.svg'), dpi=300)
 
-    return fig, ax, df
+    return fig, axes, df
 
 
 # --- Example usage -----------------------------------------------------
@@ -702,11 +721,18 @@ def plot_trajectory_over_checkpoints(csv_path_or_df, save=True, save_dir='.'):
 #   plot_sweep_timeseries(sweep_csv, save_dir=r'D:\ncap-swimmer')
 #   plot_sweep_final_distance(sweep_csv, save_dir=r'D:\ncap-swimmer')  # navigate only
 #
-# --- checkpoint comparison (varies checkpoint, fixed seed & target) ---
-#   python play.py <run_dir> --mode checkpoints --itrs 10,50,100,200,300
+# --- checkpoint comparison (varies checkpoint & target, fixed seed) ---
+#   python play.py <run_dir> --mode checkpoints --itrs 10,50,150,200,300 \
+#       --targets='-3,0;0,2'
+#   # --targets is optional; omit it to just use each checkpoint's own
+#   # trained-on target (no faceting, one plot).
 #
-#   checkpoint_csv = os.path.join(run_dir, 'checkpoint_trajectories.csv')
+#   checkpoint_csv = os.path.join(run_dir, 'checkpoint_trajectories_10-50-150-200-300.csv')
 #   plot_trajectory_over_checkpoints(checkpoint_csv, save_dir=r'D:\ncap-swimmer')
+#   # One subplot per distinct target in the CSV, each showing every
+#   # checkpoint's trajectory colored by epoch -- so with more than one
+#   # target this also shows whether later checkpoints generalize beyond
+#   # whatever they were actually trained on.
 #
 # --- training progress (from progress.csv, no play.py needed) ---
 #   run_info = extract_run_info(run_dir)
@@ -718,9 +744,10 @@ def plot_trajectory_over_checkpoints(csv_path_or_df, save=True, save_dir='.'):
 #   widgets.interact(
 #       plot_reward_weight_schedule,
 #       n_epochs=widgets.IntSlider(min=50, max=600, step=10, value=300),
-#       speed_tau=widgets.IntSlider(min=5, max=150, step=5, value=40),
-#       dir_width=widgets.IntSlider(min=5, max=150, step=5, value=40),
+#       speed_tau=widgets.IntSlider(min=5, max=300, step=5, value=40),
+#       dir_peak_epoch=widgets.IntSlider(min=0, max=600, step=10, value=90),
+#       dir_width=widgets.IntSlider(min=5, max=300, step=5, value=40),
 #       dist_start_epoch=widgets.IntSlider(min=0, max=600, step=10, value=160),
-#       dist_tau=widgets.IntSlider(min=5, max=150, step=5, value=60),
+#       dist_tau=widgets.IntSlider(min=5, max=300, step=5, value=60),
 #       temperature=widgets.FloatSlider(min=0.1, max=2.0, step=0.1, value=0.5),
 #   )

@@ -238,10 +238,13 @@ class Navigate(swimmer.Swimmer):
 
         # The sign of the rootz-to-world-heading mapping above is derived, not
         # verified against a live sim. Read back the body's actual world-frame
-        # forward direction and flip 180 degrees if it's facing away from the
-        # target, so the bias is correct regardless of that assumption.
-        xmat = physics.named.data.xmat['head']
-        forward_world = -np.array([xmat[1], xmat[4]])  # -local y axis, in world x/y
+        # forward direction (-head_yaxis -- a different sensor than
+        # speed_reward's head_vel, but the same forward convention: head_vel[1]
+        # is velocity projected onto head_yaxis, so speed_reward's -head_vel[1]
+        # and this -head_yaxis both mean "forward is the -head_yaxis direction")
+        # and flip 180 degrees if it's facing away from the target, so the bias
+        # is correct regardless of that assumption.
+        forward_world = -physics.named.data.sensordata['head_yaxis'][:2]
         if np.dot(forward_world, self._target_pos) < 0:
             physics.named.data.qpos['rootz'] += np.pi
             physics.forward()
@@ -255,17 +258,19 @@ class Navigate(swimmer.Swimmer):
         observations['body_velocities'] = physics.body_velocities()
         observations['head_orientation'] = np.concatenate([
             physics.named.data.sensordata['head_xaxis'][:2],
-            physics.named.data.sensordata['head_yaxis'][:2]
+            -physics.named.data.sensordata['head_yaxis'][:2],  # negated: forward is -head_yaxis,
+                                                                # same convention as
+                                                                # speed_reward/initialize_episode
             ])
-        
+
         # 2. Spatial navigation info, in the worm's own frame (forward/right) via
         # head_orientation, then as polar (bearing, distance) instead of raw x/y --
         # bearing in x's old "turn" slot, distance in y's old "speed" slot.
         head_pos = physics.named.data.geom_xpos['head'][:2] # [x, y] coordinates
         to_target_world = self._target_pos - head_pos
-        head_xaxis, head_yaxis = observations['head_orientation'][:2], observations['head_orientation'][2:]
-        x = np.dot(to_target_world, head_xaxis)  # lateral offset, body frame
-        y = np.dot(to_target_world, head_yaxis)  # forward offset, body frame
+        head_lateral, head_forward = observations['head_orientation'][:2], observations['head_orientation'][2:]
+        x = np.dot(to_target_world, head_lateral)  # lateral offset, body frame
+        y = np.dot(to_target_world, head_forward)  # forward offset, body frame
 
         bearing = np.arctan2(x, y)  # 0 = dead ahead, +-pi/2 = directly to the side
         distance = np.linalg.norm(to_target_world)
@@ -313,8 +318,10 @@ class Navigate(swimmer.Swimmer):
         else:
             target_dir = np.array([1.0, 0.0]) # Default fallback if right on top of target
 
-        # 4. Head Facing Vector (Normalized)
-        head_facing = physics.named.data.sensordata['head_xaxis'][:2]
+        # 4. Head Facing Vector (Normalized) -- forward is -head_yaxis, not head_xaxis
+        # (head_xaxis is the lateral/sideways axis), same convention as
+        # speed_reward/initialize_episode/get_observation.
+        head_facing = -physics.named.data.sensordata['head_yaxis'][:2]
 
         # 5. Cosine Alignment [-1.0 to 1.0]
         alignment = np.dot(head_facing, target_dir)

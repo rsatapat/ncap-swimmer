@@ -180,40 +180,46 @@ def run_sweep(policy, task, seeds, targets, max_steps=300, out_csv=None):
     return results
 
 
-def run_checkpoints(run_dir, itrs, seed=1, max_steps=300, out_csv=None):
+def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=None):
     """Roll out several itr_N.pkl checkpoints from the same run, on the same
-    seed and (each checkpoint's own default) target, to see how the
-    trajectory changes over training.
+    seed, for every (itr, target) combination, to see how the trajectory
+    changes over training -- and, with more than one target, whether a
+    checkpoint generalizes beyond whatever it was actually trained on.
 
     Args:
         run_dir: training run folder containing itr_<N>.pkl checkpoints.
         itrs: list of checkpoint epoch numbers to roll out, e.g. [10, 50, 100, 200, 300].
-        seed: random seed, shared across all checkpoints so differences in
-            the trajectory reflect the policy, not a different initial heading.
+        targets: list of (x, y) targets to try, e.g. [(-3.0, 0.0), (0.0, 2.0)].
+            Defaults to [None] -- just the checkpoint's own trained-on target.
+        seed: random seed, shared across all rollouts so differences in the
+            trajectory reflect the policy/target, not a different initial heading.
         max_steps: episode length cap for each rollout.
         out_csv: if given, write one long-format CSV here with every step of
-            every checkpoint's rollout (itr, target, step, x, y, velocity, reward).
+            every (itr, target) rollout (itr, target, step, x, y, velocity, reward).
 
     Returns:
-        list of dicts, one per itr (see rollout_episode()).
+        list of dicts, one per (itr, target) combination (see rollout_episode()).
     """
+    targets = targets if targets else [None]
     results = []
     for itr in itrs:
         policy, task = load_checkpoint(os.path.join(run_dir, f'itr_{itr}.pkl'))
-        result = rollout_episode(policy, task, seed=seed, target=None, max_steps=max_steps)
-        results.append(result)
-        print(f"itr={itr}: final_distance={result['final_distance']} "
-              f"mean_reward={result['mean_reward']:.4f} mean_velocity={result['mean_velocity']:.4f}")
+        for target in targets:
+            result = rollout_episode(policy, task, seed=seed, target=target, max_steps=max_steps)
+            result['itr'] = itr
+            results.append(result)
+            print(f"itr={itr} target={result['target']}: final_distance={result['final_distance']} "
+                  f"mean_reward={result['mean_reward']:.4f} mean_velocity={result['mean_velocity']:.4f}")
 
     if out_csv:
         with open(out_csv, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['itr', 'target', 'step', 'x', 'y', 'velocity', 'reward'])
-            for itr, r in zip(itrs, results):
+            for r in results:
                 for step, (x, y) in enumerate(r['trajectory']):
                     velocity = r['velocities'][step - 1] if step > 0 else ''
                     reward = r['rewards'][step - 1] if step > 0 else ''
-                    writer.writerow([itr, r['target'], step, x, y, velocity, reward])
+                    writer.writerow([r['itr'], r['target'], step, x, y, velocity, reward])
         print(f"Saved per-step checkpoint rollouts to {out_csv}")
 
     return results
@@ -243,21 +249,30 @@ if __name__ == '__main__':
              "combination of SEEDS/TARGETS (edit them at the top of this "
              "file) and reports the results, without rendering anything. "
              "'checkpoints' rolls out several itr_N.pkl checkpoints from one "
-             "run (--itrs) on the same seed/target, to see how the "
-             "trajectory changes over training -- writes a CSV meant to be "
-             "read (not re-run) from track_model.ipynb's "
-             "plot_trajectory_over_checkpoints, since that notebook may not "
-             "have dm_control available.",
+             "run (--itrs), for each of --targets (default: just the "
+             "checkpoint's own trained-on target), to see how the "
+             "trajectory changes over training and whether it generalizes "
+             "to other targets -- writes a CSV meant to be read (not "
+             "re-run) from track_model.ipynb's plot_trajectory_over_checkpoints, "
+             "since that notebook may not have dm_control available.",
     )
-    parser.add_argument('--n_steps', type=int, default=300, help='Max steps per episode.')
+    parser.add_argument('--n_steps', type=int, default=1000, help='Max steps per episode.')
     parser.add_argument('--itrs', default='10,50,100,200,300',
                          help='Comma-separated itr_N checkpoint numbers to roll out (--mode checkpoints only).')
+    parser.add_argument('--targets', default=None,
+                         help="Semicolon-separated x,y targets to roll out each checkpoint on, e.g. "
+                              "'-3,0;0,2' for (-3,0) and (0,2) (--mode checkpoints only). "
+                              "Defaults to just the checkpoint's own trained-on target.")
     args = parser.parse_args()
 
     if args.mode == 'checkpoints':
         itrs = [int(x) for x in args.itrs.split(',')]
-        out_csv = os.path.join(args.model, 'checkpoint_trajectories.csv')
-        run_checkpoints(args.model, itrs, max_steps=args.n_steps, out_csv=out_csv)
+        targets = None
+        if args.targets:
+            targets = [tuple(float(v) for v in pair.split(',')) for pair in args.targets.split(';')]
+        itrs_tag = '-'.join(str(itr) for itr in itrs)
+        out_csv = os.path.join(args.model, f'checkpoint_trajectories_{itrs_tag}.csv')
+        run_checkpoints(args.model, itrs, targets, max_steps=args.n_steps, out_csv=out_csv)
     else:
         print("Loading policy and weights...")
         policy, task = load_checkpoint(args.model)
