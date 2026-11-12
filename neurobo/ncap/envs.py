@@ -146,8 +146,8 @@ class Navigate(swimmer.Swimmer):
         # get_curriculum_params() can expose them for train_swimmer_es.py to
         # record into curriculum_params.json per run, without bloating the
         # CLI. Edit these directly to tune; see get_reward for how they're used.
-        self.dir_peak_epoch = 200      # 'epoch': epoch where w_dir peaks
-        self.dir_width = 150           # 'epoch': how fast w_dir rises/falls around its peak
+        self.dir_peak_epoch = 50      # 'epoch': epoch where w_dir peaks
+        self.dir_width = 250           # 'epoch': how fast w_dir rises/falls around its peak
         self.dist_start_epoch = 250    # 'epoch': epoch around which w_dist takes over
         self.dist_tau = 100            # 'epoch': how fast w_dist rises
         self.speed_tau = 150           # 'epoch': how fast w_speed's priority decays
