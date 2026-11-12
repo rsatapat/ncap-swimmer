@@ -38,12 +38,25 @@ class CPU_Unpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
-def load_checkpoint(path):
+def load_checkpoint(path, use_best=False):
     """Load a policy from a params.pkl snapshot.
 
     Also recovers the task ('swim' or 'navigate') it was trained on from
     variant.json next to the checkpoint, since params.pkl itself doesn't
     record which task made it, falling back to 'swim' if that file is missing.
+
+    Args:
+        path: path to a params.pkl/itr_N.pkl snapshot.
+        use_best: if True, load best_policy_dict (the best-reward-ever-seen
+            snapshot) instead of policy_dict (the actual as-of-that-epoch
+            weights, the default). Under a non-stationary reward curriculum
+            (w_speed/w_dir/w_dist changing over epochs), best_policy_dict is
+            usually misleading: it compares raw reward totals across epochs
+            whose reward *scale* itself differs (e.g. an early speed-dominated
+            epoch's reward ceiling is structurally higher than a later
+            distance-dominated one's), so "best" tends to freeze on an early
+            epoch and never update again -- every itr_N.pkl checkpoint from
+            that point on shares the exact same frozen best_policy_dict.
 
     Returns:
         (policy, task)
@@ -52,7 +65,7 @@ def load_checkpoint(path):
         data = CPU_Unpickler(f).load()
 
     policy = data['policy_cls'](**data['policy_kwargs'])
-    policy.set_param_values(data['best_policy_dict'])
+    policy.set_param_values(data['best_policy_dict'] if use_best else data['policy_dict'])
 
     task = 'swim'
     variant_path = os.path.join(os.path.dirname(path), 'variant.json')
@@ -83,7 +96,11 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
         dict with seed, target, total_reward, mean_reward, mean_velocity,
         final_distance (None for swim), trajectory (head xy per step, shape
         (T+1, 2)), velocities (per-step, shape (T,)), rewards (per-step,
-        shape (T,)), and frames (list of RGB arrays, only if render=True).
+        shape (T,)), bearings/obs_distances (per step incl. the initial
+        reset state, shape (T+1,), navigate only -- the policy's own
+        to_target observation, for checking e.g. whether initialize_episode's
+        heading bias actually starts bearing small), and frames (list of RGB
+        arrays, only if render=True).
     """
     task_kwargs = dict(random=seed)
     if task == 'navigate' and target is not None:
@@ -91,10 +108,19 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
     env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs))
     physics = env._env.physics
 
+    def _to_target():
+        # Only navigate's get_observation has a 'to_target' entry.
+        obs_dict = env._env.task.get_observation(physics)
+        to_target = obs_dict.get('to_target') if task == 'navigate' else None
+        return (None, None) if to_target is None else (float(to_target[0]), float(to_target[1]))
+
     obs, _ = env.reset()
     trajectory = [physics.named.data.geom_xpos['head'][:2].copy()]
     rewards = []
     velocities = []
+    bearing0, distance0 = _to_target()
+    bearings = [bearing0]
+    obs_distances = [distance0]
     frames = [physics.render(height=480, width=640, camera_id=0)] if render else None
 
     for _ in range(max_steps):
@@ -104,6 +130,10 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
         rewards.append(step.reward)
         velocities.append(-step.env_info['body_velocities'][1])
         trajectory.append(physics.named.data.geom_xpos['head'][:2].copy())
+        if task == 'navigate':
+            bearing, obs_distance = step.env_info['to_target']
+            bearings.append(float(bearing))
+            obs_distances.append(float(obs_distance))
         if render:
             frames.append(physics.render(height=480, width=640, camera_id=0))
         if step.last:
@@ -129,6 +159,8 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
         'trajectory': trajectory,
         'velocities': np.array(velocities),
         'rewards': np.array(rewards),
+        'bearings': np.array(bearings),
+        'obs_distances': np.array(obs_distances),
         'frames': frames,
     }
 
@@ -146,9 +178,11 @@ def run_sweep(policy, task, seeds, targets, max_steps=300, out_csv=None):
         targets: list of (x, y) targets to try (navigate only).
         max_steps: episode length cap.
         out_csv: if given, write one long-format CSV here with every step of
-            every run (seed, target, step, x, y, velocity, reward). Per-run
-            summaries like final_distance can be derived from this later
-            (e.g. the last step's x/y per (seed, target) group).
+            every run (seed, target, step, x, y, velocity, reward, bearing,
+            obs_distance -- the latter two are the policy's own to_target
+            observation, navigate only). Per-run summaries like final_distance
+            can be derived from this later (e.g. the last step's x/y per
+            (seed, target) group).
 
     Returns:
         list of dicts, one per run (see rollout_episode()).
@@ -167,15 +201,18 @@ def run_sweep(policy, task, seeds, targets, max_steps=300, out_csv=None):
     if out_csv:
         with open(out_csv, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['seed', 'target', 'step', 'x', 'y', 'velocity', 'reward'])
+            writer.writerow(['seed', 'target', 'step', 'x', 'y', 'velocity', 'reward', 'bearing', 'obs_distance'])
             for r in results:
-                # trajectory has one more point than velocities/rewards (the
-                # initial reset position has no step taken from it yet).
+                # trajectory/bearings/obs_distances have one more point than
+                # velocities/rewards (the initial reset position has no step
+                # taken from it yet).
                 for step, (x, y) in enumerate(r['trajectory']):
                     velocity = r['velocities'][step - 1] if step > 0 else ''
                     reward = r['rewards'][step - 1] if step > 0 else ''
-                    writer.writerow([r['seed'], r['target'], step, x, y, velocity, reward])
-        print(f"Saved per-step results (location, speed, reward) to {out_csv}")
+                    bearing = r['bearings'][step] if r['bearings'][step] is not None else ''
+                    obs_distance = r['obs_distances'][step] if r['obs_distances'][step] is not None else ''
+                    writer.writerow([r['seed'], r['target'], step, x, y, velocity, reward, bearing, obs_distance])
+        print(f"Saved per-step results (location, speed, reward, bearing, obs_distance) to {out_csv}")
 
     return results
 
@@ -195,7 +232,9 @@ def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=
             trajectory reflect the policy/target, not a different initial heading.
         max_steps: episode length cap for each rollout.
         out_csv: if given, write one long-format CSV here with every step of
-            every (itr, target) rollout (itr, target, step, x, y, velocity, reward).
+            every (itr, target) rollout (itr, target, step, x, y, velocity,
+            reward, bearing, obs_distance -- the latter two are the policy's
+            own to_target observation, navigate only).
 
     Returns:
         list of dicts, one per (itr, target) combination (see rollout_episode()).
@@ -214,13 +253,15 @@ def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=
     if out_csv:
         with open(out_csv, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['itr', 'target', 'step', 'x', 'y', 'velocity', 'reward'])
+            writer.writerow(['itr', 'target', 'step', 'x', 'y', 'velocity', 'reward', 'bearing', 'obs_distance'])
             for r in results:
                 for step, (x, y) in enumerate(r['trajectory']):
                     velocity = r['velocities'][step - 1] if step > 0 else ''
                     reward = r['rewards'][step - 1] if step > 0 else ''
-                    writer.writerow([r['itr'], r['target'], step, x, y, velocity, reward])
-        print(f"Saved per-step checkpoint rollouts to {out_csv}")
+                    bearing = r['bearings'][step] if r['bearings'][step] is not None else ''
+                    obs_distance = r['obs_distances'][step] if r['obs_distances'][step] is not None else ''
+                    writer.writerow([r['itr'], r['target'], step, x, y, velocity, reward, bearing, obs_distance])
+        print(f"Saved per-step checkpoint rollouts (incl. bearing/obs_distance) to {out_csv}")
 
     return results
 
@@ -263,6 +304,8 @@ if __name__ == '__main__':
                          help="Semicolon-separated x,y targets to roll out each checkpoint on, e.g. "
                               "'-3,0;0,2' for (-3,0) and (0,2) (--mode checkpoints only). "
                               "Defaults to just the checkpoint's own trained-on target.")
+    parser.add_argument('--seed', type=int, default=1,
+                         help='Random seed, shared across every (itr, target) rollout (--mode checkpoints only).')
     args = parser.parse_args()
 
     if args.mode == 'checkpoints':
@@ -271,8 +314,8 @@ if __name__ == '__main__':
         if args.targets:
             targets = [tuple(float(v) for v in pair.split(',')) for pair in args.targets.split(';')]
         itrs_tag = '-'.join(str(itr) for itr in itrs)
-        out_csv = os.path.join(args.model, f'checkpoint_trajectories_{itrs_tag}.csv')
-        run_checkpoints(args.model, itrs, targets, max_steps=args.n_steps, out_csv=out_csv)
+        out_csv = os.path.join(args.model, f'checkpoint_trajectories_{itrs_tag}_seed{args.seed}.csv')
+        run_checkpoints(args.model, itrs, targets, seed=args.seed, max_steps=args.n_steps, out_csv=out_csv)
     else:
         print("Loading policy and weights...")
         policy, task = load_checkpoint(args.model)

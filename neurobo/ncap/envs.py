@@ -147,12 +147,20 @@ class Navigate(swimmer.Swimmer):
         # record into curriculum_params.json per run, without bloating the
         # CLI. Edit these directly to tune; see get_reward for how they're used.
         self.dir_peak_epoch = 200      # 'epoch': epoch where w_dir peaks
-        self.dir_width = 100           # 'epoch': how fast w_dir rises/falls around its peak
+        self.dir_width = 150           # 'epoch': how fast w_dir rises/falls around its peak
         self.dist_start_epoch = 250    # 'epoch': epoch around which w_dist takes over
         self.dist_tau = 100            # 'epoch': how fast w_dist rises
-        self.speed_tau = 250           # 'epoch': how fast w_speed's priority decays
+        self.speed_tau = 150           # 'epoch': how fast w_speed's priority decays
         self.epoch_temperature = 0.5   # 'epoch': softmax temperature
         self.value_temperature = 0.1   # 'value_gated'/'value_free': softmax temperature
+
+        # dir_reward = ((alignment + 1) / 2) ** dir_reward_p. p=1 is plain
+        # cosine similarity (zero gradient exactly at full misalignment,
+        # where a stuck policy tends to sit). p<1 stretches out
+        # differences near full misalignment, giving ES's rank-based
+        # gradient more to work with there. See track_model.py's
+        # plot_dir_reward_shapes to compare values before changing this.
+        self.dir_reward_p = 0.25
 
     def get_curriculum_params(self):
         """Return this task's curriculum settings as a plain dict, for
@@ -170,6 +178,7 @@ class Navigate(swimmer.Swimmer):
             'speed_tau': self.speed_tau,
             'epoch_temperature': self.epoch_temperature,
             'value_temperature': self.value_temperature,
+            'dir_reward_p': self.dir_reward_p,
         }
 
     def set_epoch(self, epoch: int):
@@ -325,7 +334,9 @@ class Navigate(swimmer.Swimmer):
 
         # 5. Cosine Alignment [-1.0 to 1.0]
         alignment = np.dot(head_facing, target_dir)
-        dir_reward = 0.5 * (alignment + 1.0)  # rescale to [0, 1]
+        # Rescale to [0, 1], then reshape with dir_reward_p (<1 stretches out
+        # differences near full misalignment -- see self.dir_reward_p).
+        dir_reward = (0.5 * (alignment + 1.0)) ** self.dir_reward_p
         
         # Record this step's sub-rewards for Agent.rollout to read back after
         # the episode ends (see initialize_episode / update_curriculum_ema).
