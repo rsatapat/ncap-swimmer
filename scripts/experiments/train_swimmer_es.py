@@ -61,6 +61,10 @@ import estorch
        "'value_free' (performance-based, no ordering), or fixed-weight baselines with "
        "no curriculum at all -- 'dist_only', 'dir_only', 'dist_and_dir' (w_dir=w_dist=0.5). "
        "Only matters for --task=navigate.")
+@click.option('--warm_start', is_flag=True, default=False,
+  help='Resume from an old checkpoint instead of training from scratch. Requires --warm_start_path.')
+@click.option('--warm_start_path', default=None,
+  help="Path to the itr_N.pkl (or params.pkl) checkpoint to warm-start from. Only used if --warm_start is set.")
 @click.option('--seed', default=1, help='Random seed.')
 @wrap_experiment(
   prefix='experiments/swimmer/swimmer_es',
@@ -90,6 +94,8 @@ def swimmer_es(
   include_turn_control,
   osc_period,
   curriculum,
+  warm_start,
+  warm_start_path,
   seed,
 ):
   assert population_size % n_proc == 0 and population_size % 2 == 0
@@ -284,9 +290,10 @@ def swimmer_es(
   )
 
   # --- one-off warm start from an old checkpoint ---
-  WARM_START = False  # <- set to True to resume from WARM_START_PATH below
-  if rank == 0 and WARM_START:
+  if rank == 0 and warm_start:
     import io, pickle, re, glob
+
+    assert warm_start_path, '--warm_start requires --warm_start_path to be set.'
 
     class CPU_Unpickler(pickle.Unpickler):
       def find_class(self, module, name):
@@ -294,7 +301,7 @@ def swimmer_es(
           return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
         return super().find_class(module, name)
 
-    WARM_START_PATH = r'/home/vatsala/sroshan/ncap-swimmer/data/local/experiments/swimmer/swimmer_es/2026-11-06_10-38-56_12/itr_140.pkl'  # <- edit this path
+    WARM_START_PATH = warm_start_path
     with open(WARM_START_PATH, 'rb') as f:
       ckpt = CPU_Unpickler(f).load()
     es.policy.load_state_dict(ckpt['best_policy_dict'])  # use ckpt['policy_dict'] for the last (not best) weights instead
