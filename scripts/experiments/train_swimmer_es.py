@@ -304,7 +304,11 @@ def swimmer_es(
     WARM_START_PATH = warm_start_path
     with open(WARM_START_PATH, 'rb') as f:
       ckpt = CPU_Unpickler(f).load()
-    es.policy.load_state_dict(ckpt['best_policy_dict'])  # use ckpt['policy_dict'] for the last (not best) weights instead
+    # policy_dict (not best_policy_dict): best_policy_dict freezes once the
+    # curriculum moves past its easiest-to-maximize phase (see play.py's
+    # load_checkpoint for the same issue) -- policy_dict is the actual
+    # as-of-this-checkpoint weights, which is what a continuation should resume.
+    es.policy.load_state_dict(ckpt['policy_dict'])
     es.best_policy_dict = ckpt['best_policy_dict']
     es.best_reward = -float('inf')  # so logging still improves monotonically from here
 

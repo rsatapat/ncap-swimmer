@@ -11,6 +11,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# Mirrors Navigate.get_reward's FIXED_WEIGHTS in envs.py -- (w_speed, w_dir, w_dist)
+# for each fixed-weight (non-'epoch') curriculum baseline. Keep in sync if that
+# dict ever changes.
+FIXED_CURRICULUM_WEIGHTS = {
+    'dist_only': (0.0, 0.0, 1.0),
+    'dir_only': (0.0, 1.0, 0.0),
+    'dist_and_dir': (0.0, 0.5, 0.5),
+}
+
 
 def _infer_task(df):
     has_target_data = 'DistanceFromTarget' in df.columns and df['DistanceFromTarget'].notna().any()
@@ -45,14 +54,22 @@ def _load_progress(csv_path):
 
 
 def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.'):
-    """Plot reward (avg/min/max/current), velocity and (for navigate runs)
-    distance from target vs epoch.
+    """Plot reward (avg/min/max/current), velocity, (for navigate runs)
+    distance from target, and (if run_info has curriculum_params) the
+    w_speed/w_dir/w_dist curriculum weights, vs epoch.
 
     The task is inferred straight from progress.csv: 'DistanceFromTarget' is
     logged for every run, but it's all NaN when there's no target (swim), so a
     run is 'navigate' only if that column actually has values. This is more
     reliable than trusting variant.json, which can disagree with what was
     actually logged.
+
+    The curriculum-weight panel is only shown when run_info is given and has
+    curriculum_params (see extract_run_info/load_curriculum_params): for
+    'epoch' it's recomputed from the constants via softmax_reward_weights;
+    for the fixed-weight baselines (dist_only/dir_only/dist_and_dir) it's
+    just constant lines; for 'value_gated'/'value_free' it's skipped, since
+    those depend on a live EMA that isn't logged to progress.csv.
 
     Args:
         csv_path: path to a progress.csv, or a list of paths (in chronological
@@ -61,7 +78,8 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.'):
             must belong to the same task (swim vs. navigate).
         run_info: optional dict from extract_run_info(). When given, a short summary
             of the run's key settings is printed in a box above the plots so each
-            figure is self-describing.
+            figure is self-describing, and the curriculum-weight panel (above)
+            is added if possible.
         save: if True, save the figure as an SVG named after the run folder.
         save_dir: directory to save the figure in.
 
@@ -76,6 +94,27 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.'):
     if task == 'navigate':
         panels.append(('DistanceFromTarget', 'Distance from target'))
     panels.append(('MeanVelocity', 'Velocity'))
+
+    # If we know this run's curriculum and its constants, show w_speed/w_dir/w_dist
+    # vs epoch too, so the plot makes clear what the curriculum was doing at each
+    # point. Only computable for 'epoch' (recomputed from its constants) and the
+    # fixed-weight baselines (constant lines) -- 'value_gated'/'value_free' depend
+    # on a live EMA that isn't logged to progress.csv, so skipped for those.
+    curriculum = run_info['variant'].get('curriculum') if (task == 'navigate' and run_info) else None
+    curriculum_params = run_info.get('curriculum_params') if run_info else None
+    weights = None
+    if curriculum == 'epoch' and curriculum_params:
+        weights = softmax_reward_weights(
+            df['Epoch'].values, df['Epoch'].max(),
+            curriculum_params['speed_tau'], curriculum_params['dir_peak_epoch'],
+            curriculum_params['dir_width'], curriculum_params['dist_start_epoch'],
+            curriculum_params['dist_tau'], curriculum_params['epoch_temperature'])
+    elif curriculum in FIXED_CURRICULUM_WEIGHTS:
+        w_speed, w_dir, w_dist = FIXED_CURRICULUM_WEIGHTS[curriculum]
+        ones = np.ones(len(df))
+        weights = (w_speed * ones, w_dir * ones, w_dist * ones)
+    if weights is not None:
+        panels.append((None, 'Curriculum weight'))
 
     summary = format_run_summary(run_info) if run_info is not None else None
     # Reserve extra figure height for the summary box, roughly one line per row of text.
@@ -93,6 +132,13 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.'):
             a.plot(df['Epoch'], df[col], label='avg')
             if 'CurrentReturn' in df.columns:
                 a.plot(df['Epoch'], df['CurrentReturn'], label='current', alpha=0.8, linewidth=1)
+            a.legend(fontsize=8, loc='upper left')
+        elif col is None:  # the curriculum-weight panel
+            w_speed, w_dir, w_dist = weights
+            a.plot(df['Epoch'], w_speed, label='w_speed')
+            a.plot(df['Epoch'], w_dir, label='w_dir')
+            a.plot(df['Epoch'], w_dist, label='w_dist')
+            a.set_ylim(-0.05, 1.05)
             a.legend(fontsize=8, loc='upper left')
         else:
             a.plot(df['Epoch'], df[col])
