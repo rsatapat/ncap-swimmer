@@ -42,12 +42,13 @@ def navigate(
   random=None,
   environment_kwargs={},
   curriculum='epoch',  # 'epoch', 'value_gated', or 'value_free' -- see Navigate.get_reward
+  bias_initial_heading=True,  # see Navigate.__init__
 ):
   """Returns the Navigate task for a n-link swimmer."""
   model_string, assets = swimmer.get_model_and_assets(n_links)
   physics = swimmer.Physics.from_xml_string(model_string, assets=assets)
   task = Navigate(target_pos=target_pos, desired_speed=desired_speed, random=random,
-                   curriculum=curriculum)
+                   curriculum=curriculum, bias_initial_heading=bias_initial_heading)
   # print(time_limit, swimmer._CONTROL_TIMESTEP)
   return control.Environment(
     physics,
@@ -103,7 +104,7 @@ class Navigate(swimmer.Swimmer):
     """A task to reward the swimmer for navigating to a specific coordinate."""
 
     def __init__(self, target_pos=(2.0, 2.0), desired_speed=_SWIM_SPEED, random=None,
-                 curriculum='epoch', ema_alpha=0.1):
+                 curriculum='epoch', ema_alpha=0.1, bias_initial_heading=True):
         """Initialize the task.
         Args:
             target_pos: A tuple/list of (X, Y) coordinates for the target.
@@ -118,6 +119,11 @@ class Navigate(swimmer.Swimmer):
                 update_curriculum_ema), not once per step, so this is a
                 per-epoch time constant: 0.1 means ~10 epochs to adapt,
                 not ~10 steps. Smaller = slower/smoother.
+            bias_initial_heading: if True (default), initialize_episode biases
+                the swimmer's starting heading to within +-45 degrees of
+                facing the target, instead of the base class's uniform random
+                heading over the full circle. Set False to test/train with
+                the harder, unbiased full-circle start.
         """
         super().__init__(random=random)
         self._target_pos = np.array(target_pos)
@@ -130,6 +136,7 @@ class Navigate(swimmer.Swimmer):
         self.current_epoch = 0
 
         self.curriculum = curriculum
+        self.bias_initial_heading = bias_initial_heading
         self._ema_alpha = ema_alpha
         # Running averages of each sub-reward, used by the 'value_*' curricula
         # as a slow-moving measure of "how mastered is this objective right
@@ -238,25 +245,28 @@ class Navigate(swimmer.Swimmer):
         # super().initialize_episode() randomizes rootz (heading) uniformly over the
         # full circle. That can start the swimmer facing ~180 degrees away from the
         # target, needing a hard U-turn before it can make any progress at all. Bias
-        # it instead to within +-45 degrees of facing the target.
-        target_bearing = np.arctan2(self._target_pos[0], -self._target_pos[1])
-        heading_spread = np.pi / 4  # +-45 degrees
-        physics.named.data.qpos['rootz'] = (
-            target_bearing + self.random.uniform(-heading_spread, heading_spread))
-        physics.forward()  # Recompute kinematics so xmat below reflects the new heading.
+        # it instead to within +-45 degrees of facing the target -- unless
+        # bias_initial_heading is False, in which case leave the base class's
+        # uniform full-circle heading alone.
+        if self.bias_initial_heading:
+            target_bearing = np.arctan2(self._target_pos[0], -self._target_pos[1])
+            heading_spread = np.pi / 4  # +-45 degrees
+            physics.named.data.qpos['rootz'] = (
+                target_bearing + self.random.uniform(-heading_spread, heading_spread))
+            physics.forward()  # Recompute kinematics so xmat below reflects the new heading.
 
-        # The sign of the rootz-to-world-heading mapping above is derived, not
-        # verified against a live sim. Read back the body's actual world-frame
-        # forward direction (-head_yaxis -- a different sensor than
-        # speed_reward's head_vel, but the same forward convention: head_vel[1]
-        # is velocity projected onto head_yaxis, so speed_reward's -head_vel[1]
-        # and this -head_yaxis both mean "forward is the -head_yaxis direction")
-        # and flip 180 degrees if it's facing away from the target, so the bias
-        # is correct regardless of that assumption.
-        forward_world = -physics.named.data.sensordata['head_yaxis'][:2]
-        if np.dot(forward_world, self._target_pos) < 0:
-            physics.named.data.qpos['rootz'] += np.pi
-            physics.forward()
+            # The sign of the rootz-to-world-heading mapping above is derived, not
+            # verified against a live sim. Read back the body's actual world-frame
+            # forward direction (-head_yaxis -- a different sensor than
+            # speed_reward's head_vel, but the same forward convention: head_vel[1]
+            # is velocity projected onto head_yaxis, so speed_reward's -head_vel[1]
+            # and this -head_yaxis both mean "forward is the -head_yaxis direction")
+            # and flip 180 degrees if it's facing away from the target, so the bias
+            # is correct regardless of that assumption.
+            forward_world = -physics.named.data.sensordata['head_yaxis'][:2]
+            if np.dot(forward_world, self._target_pos) < 0:
+                physics.named.data.qpos['rootz'] += np.pi
+                physics.forward()
 
     def get_observation(self, physics):
         """Returns joint state, body velocities, and relative vector to the target."""

@@ -70,6 +70,10 @@ import estorch
        "the checkpoint's itr_N filename/progress.csv. Needed when --warm_start_path itself points "
        "into a run that was already a warm-started continuation: that run's own itr_N is a local "
        "step count, not the true cumulative epoch.")
+@click.option('--no_bias_initial_heading', is_flag=True, default=False,
+  help="Disable Navigate's default behavior of biasing each episode's starting heading to within "
+       "+-45 degrees of facing the target. With this set, the heading is uniform random over the "
+       "full circle (the dm_control base class default). Only matters for --task=navigate.")
 @click.option('--seed', default=1, help='Random seed.')
 @wrap_experiment(
   prefix='experiments/swimmer/swimmer_es',
@@ -102,6 +106,7 @@ def swimmer_es(
   warm_start,
   warm_start_path,
   warm_start_epoch_offset,
+  no_bias_initial_heading,
   seed,
 ):
   assert population_size % n_proc == 0 and population_size % 2 == 0
@@ -118,6 +123,7 @@ def swimmer_es(
   task_kwargs = dict(random=seed)
   if task == 'navigate':
     task_kwargs['curriculum'] = curriculum
+    task_kwargs['bias_initial_heading'] = not no_bias_initial_heading
 
   env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs)) #this loads the task from envs.py
 
