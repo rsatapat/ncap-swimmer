@@ -65,6 +65,11 @@ import estorch
   help='Resume from an old checkpoint instead of training from scratch. Requires --warm_start_path.')
 @click.option('--warm_start_path', default=None,
   help="Path to the itr_N.pkl (or params.pkl) checkpoint to warm-start from. Only used if --warm_start is set.")
+@click.option('--warm_start_epoch_offset', default=None, type=int,
+  help="Override the curriculum epoch offset to resume from, instead of auto-detecting it from "
+       "the checkpoint's itr_N filename/progress.csv. Needed when --warm_start_path itself points "
+       "into a run that was already a warm-started continuation: that run's own itr_N is a local "
+       "step count, not the true cumulative epoch.")
 @click.option('--seed', default=1, help='Random seed.')
 @wrap_experiment(
   prefix='experiments/swimmer/swimmer_es',
@@ -96,6 +101,7 @@ def swimmer_es(
   curriculum,
   warm_start,
   warm_start_path,
+  warm_start_epoch_offset,
   seed,
 ):
   assert population_size % n_proc == 0 and population_size % 2 == 0
@@ -313,18 +319,24 @@ def swimmer_es(
     es.best_reward = -float('inf')  # so logging still improves monotonically from here
 
     # Resume the reward decay schedule (self.current_epoch) from where the old run left off.
-    warm_start_dir = os.path.dirname(WARM_START_PATH)
-    match = re.search(r'itr_(\d+)\.pkl$', os.path.basename(WARM_START_PATH))
-    if match:
-      epoch_offset = int(match.group(1))
+    if warm_start_epoch_offset is not None:
+      # Explicit override -- required when warm_start_path itself points into a run that
+      # was already a warm-started continuation, since that run's own itr_N is a local step
+      # count (resets to 0 each time an ES instance is created), not the true cumulative epoch.
+      epoch_offset = warm_start_epoch_offset
     else:
-      itr_files = glob.glob(os.path.join(warm_start_dir, 'itr_*.pkl'))
-      itr_nums = [int(re.search(r'itr_(\d+)\.pkl$', f).group(1)) for f in itr_files]
-      if itr_nums:
-        epoch_offset = max(itr_nums)
+      warm_start_dir = os.path.dirname(WARM_START_PATH)
+      match = re.search(r'itr_(\d+)\.pkl$', os.path.basename(WARM_START_PATH))
+      if match:
+        epoch_offset = int(match.group(1))
       else:
-        import pandas as pd
-        epoch_offset = int(pd.read_csv(os.path.join(warm_start_dir, 'progress.csv'))['Epoch'].max())
+        itr_files = glob.glob(os.path.join(warm_start_dir, 'itr_*.pkl'))
+        itr_nums = [int(re.search(r'itr_(\d+)\.pkl$', f).group(1)) for f in itr_files]
+        if itr_nums:
+          epoch_offset = max(itr_nums)
+        else:
+          import pandas as pd
+          epoch_offset = int(pd.read_csv(os.path.join(warm_start_dir, 'progress.csv'))['Epoch'].max())
     es.current_epoch = epoch_offset
 
     print(f'Warm-started policy from {WARM_START_PATH}, current_epoch set to {epoch_offset}')
