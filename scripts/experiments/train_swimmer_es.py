@@ -302,29 +302,25 @@ def swimmer_es(
   )
 
   # --- one-off warm start from an old checkpoint ---
-  if rank == 0 and warm_start:
-    import io, pickle, re, glob
+  if warm_start:
+    import re, glob
 
     assert warm_start_path, '--warm_start requires --warm_start_path to be set.'
-
-    class CPU_Unpickler(pickle.Unpickler):
-      def find_class(self, module, name):
-        if module == 'torch.storage' and name == '_load_from_bytes':
-          return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
-        return super().find_class(module, name)
-
     WARM_START_PATH = warm_start_path
-    with open(WARM_START_PATH, 'rb') as f:
-      ckpt = CPU_Unpickler(f).load()
-    # policy_dict (not best_policy_dict): best_policy_dict freezes once the
-    # curriculum moves past its easiest-to-maximize phase (see play.py's
-    # load_checkpoint for the same issue) -- policy_dict is the actual
-    # as-of-this-checkpoint weights, which is what a continuation should resume.
-    es.policy.load_state_dict(ckpt['policy_dict'])
-    es.best_policy_dict = ckpt['best_policy_dict']
-    es.best_reward = -float('inf')  # so logging still improves monotonically from here
 
-    # Resume the reward decay schedule (self.current_epoch) from where the old run left off.
+    # Resume the reward decay schedule (self.current_epoch) from where the old run
+    # left off -- every rank computes and applies this independently (not just
+    # rank 0): the 'epoch' curriculum's reward weighting depends on current_epoch,
+    # and each worker rank scores its share of the population using its OWN
+    # Agent/task, not rank 0's. Previously this was only set on rank 0, so on a
+    # warm-started run, worker ranks' current_epoch silently stayed at 0 (each
+    # ES instance's own init value) and climbed from there -- meaning most of the
+    # population (every rank but 0) was scored under a near-epoch-0 curriculum
+    # (mostly w_speed, easy) while rank 0's own share and the post-update "current"
+    # policy were scored under the true, correct epoch. That produced exactly the
+    # kind of reward/population split seen right at warm-start boundaries for the
+    # 'epoch' curriculum specifically (the fixed-weight curricula don't depend on
+    # current_epoch at all, so they were never affected).
     if warm_start_epoch_offset is not None:
       # Explicit override -- required when warm_start_path itself points into a run that
       # was already a warm-started continuation, since that run's own itr_N is a local step
@@ -345,7 +341,26 @@ def swimmer_es(
           epoch_offset = int(pd.read_csv(os.path.join(warm_start_dir, 'progress.csv'))['Epoch'].max())
     es.current_epoch = epoch_offset
 
-    print(f'Warm-started policy from {WARM_START_PATH}, current_epoch set to {epoch_offset}')
+    if rank == 0:
+      import io, pickle
+
+      class CPU_Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+          if module == 'torch.storage' and name == '_load_from_bytes':
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+          return super().find_class(module, name)
+
+      with open(WARM_START_PATH, 'rb') as f:
+        ckpt = CPU_Unpickler(f).load()
+      # policy_dict (not best_policy_dict): best_policy_dict freezes once the
+      # curriculum moves past its easiest-to-maximize phase (see play.py's
+      # load_checkpoint for the same issue) -- policy_dict is the actual
+      # as-of-this-checkpoint weights, which is what a continuation should resume.
+      es.policy.load_state_dict(ckpt['policy_dict'])
+      es.best_policy_dict = ckpt['best_policy_dict']
+      es.best_reward = -float('inf')  # so logging still improves monotonically from here
+
+      print(f'Warm-started policy from {WARM_START_PATH}, current_epoch set to {epoch_offset}')
   # --- end warm start ---
 
   if rank == 0 and os.getenv('MPI_PARENT') is not None:
