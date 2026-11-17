@@ -42,13 +42,13 @@ def navigate(
   random=None,
   environment_kwargs={},
   curriculum='epoch',  # 'epoch', 'value_gated', or 'value_free' -- see Navigate.get_reward
-  bias_initial_heading=True,  # see Navigate.__init__
+  initial_heading_mode='toward_target',  # see Navigate.__init__
 ):
   """Returns the Navigate task for a n-link swimmer."""
   model_string, assets = swimmer.get_model_and_assets(n_links)
   physics = swimmer.Physics.from_xml_string(model_string, assets=assets)
   task = Navigate(target_pos=target_pos, desired_speed=desired_speed, random=random,
-                   curriculum=curriculum, bias_initial_heading=bias_initial_heading)
+                   curriculum=curriculum, initial_heading_mode=initial_heading_mode)
   # print(time_limit, swimmer._CONTROL_TIMESTEP)
   return control.Environment(
     physics,
@@ -103,8 +103,11 @@ class Swim(swimmer.Swimmer):
 class Navigate(swimmer.Swimmer):
     """A task to reward the swimmer for navigating to a specific coordinate."""
 
+    # Valid initial_heading_mode values -- see __init__/initialize_episode.
+    HEADING_MODES = ('toward_target', 'uniform', 'away_from_target')
+
     def __init__(self, target_pos=(2.0, 2.0), desired_speed=_SWIM_SPEED, random=None,
-                 curriculum='epoch', ema_alpha=0.1, bias_initial_heading=True):
+                 curriculum='epoch', ema_alpha=0.1, initial_heading_mode='toward_target'):
         """Initialize the task.
         Args:
             target_pos: A tuple/list of (X, Y) coordinates for the target.
@@ -119,12 +122,20 @@ class Navigate(swimmer.Swimmer):
                 update_curriculum_ema), not once per step, so this is a
                 per-epoch time constant: 0.1 means ~10 epochs to adapt,
                 not ~10 steps. Smaller = slower/smoother.
-            bias_initial_heading: if True (default), initialize_episode biases
-                the swimmer's starting heading to within +-45 degrees of
-                facing the target, instead of the base class's uniform random
-                heading over the full circle. Set False to test/train with
-                the harder, unbiased full-circle start.
+            initial_heading_mode: how initialize_episode picks the swimmer's
+                starting heading. One of:
+                - 'toward_target' (default): biased to within +-45 degrees of
+                  facing the target, instead of the base class's uniform
+                  random heading over the full circle.
+                - 'uniform': the base class's original uniform random heading
+                  over the full circle, un-biased either way.
+                - 'away_from_target': biased to within +-45 degrees of facing
+                  directly AWAY from the target -- the hardest-possible start,
+                  for stress-testing whether a policy can recover from a full
+                  U-turn rather than relying on an easy start.
         """
+        assert initial_heading_mode in self.HEADING_MODES, (
+            f'initial_heading_mode must be one of {self.HEADING_MODES}, got {initial_heading_mode!r}')
         super().__init__(random=random)
         self._target_pos = np.array(target_pos)
         self._desired_speed = desired_speed
@@ -136,7 +147,7 @@ class Navigate(swimmer.Swimmer):
         self.current_epoch = 0
 
         self.curriculum = curriculum
-        self.bias_initial_heading = bias_initial_heading
+        self.initial_heading_mode = initial_heading_mode
         self._ema_alpha = ema_alpha
         # Running averages of each sub-reward, used by the 'value_*' curricula
         # as a slow-moving measure of "how mastered is this objective right
@@ -243,13 +254,16 @@ class Navigate(swimmer.Swimmer):
         physics.named.data.qpos['rooty'] = 0.
 
         # super().initialize_episode() randomizes rootz (heading) uniformly over the
-        # full circle. That can start the swimmer facing ~180 degrees away from the
-        # target, needing a hard U-turn before it can make any progress at all. Bias
-        # it instead to within +-45 degrees of facing the target -- unless
-        # bias_initial_heading is False, in which case leave the base class's
-        # uniform full-circle heading alone.
-        if self.bias_initial_heading:
+        # full circle ('uniform' mode leaves that alone). 'toward_target' biases it
+        # instead to within +-45 degrees of facing the target, so most episodes don't
+        # need a hard U-turn before making any progress. 'away_from_target' biases it
+        # to within +-45 degrees of facing directly AWAY from the target instead --
+        # the hardest-possible start, forcing a genuine U-turn every episode, for
+        # stress-testing whether a policy can actually recover from one.
+        if self.initial_heading_mode != 'uniform':
             target_bearing = np.arctan2(self._target_pos[0], -self._target_pos[1])
+            if self.initial_heading_mode == 'away_from_target':
+                target_bearing += np.pi
             heading_spread = np.pi / 4  # +-45 degrees
             physics.named.data.qpos['rootz'] = (
                 target_bearing + self.random.uniform(-heading_spread, heading_spread))
@@ -261,10 +275,14 @@ class Navigate(swimmer.Swimmer):
             # speed_reward's head_vel, but the same forward convention: head_vel[1]
             # is velocity projected onto head_yaxis, so speed_reward's -head_vel[1]
             # and this -head_yaxis both mean "forward is the -head_yaxis direction")
-            # and flip 180 degrees if it's facing away from the target, so the bias
-            # is correct regardless of that assumption.
+            # and flip 180 degrees if it landed on the wrong side, so the bias is
+            # correct regardless of that assumption. "Wrong side" flips meaning
+            # between the two modes: toward_target wants a positive dot product
+            # with the target direction, away_from_target wants a negative one.
             forward_world = -physics.named.data.sensordata['head_yaxis'][:2]
-            if np.dot(forward_world, self._target_pos) < 0:
+            alignment = np.dot(forward_world, self._target_pos)
+            wrong_side = alignment < 0 if self.initial_heading_mode == 'toward_target' else alignment > 0
+            if wrong_side:
                 physics.named.data.qpos['rootz'] += np.pi
                 physics.forward()
 

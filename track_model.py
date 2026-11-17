@@ -63,23 +63,28 @@ def _load_progress(csv_path):
     return df, [(df['Epoch'].min(), df['Epoch'].max(), csv_path)]
 
 
-def get_bias_initial_heading(run_dir):
-    """Read whether a run was trained with Navigate's heading bias on (the
-    default) or off (--no_bias_initial_heading), from its variant.json.
+def get_initial_heading_mode(run_dir):
+    """Read which initial-heading mode a run was trained with, from its
+    variant.json. Understands both the current 3-way --initial_heading_mode
+    CLI flag ('toward_target'/'uniform'/'away_from_target') and the older
+    boolean --no_bias_initial_heading flag it replaced, for runs from before
+    'away_from_target' existed.
 
     Args:
         run_dir: folder containing variant.json.
 
     Returns:
-        bool: True (bias on) unless the run's variant.json has
-        no_bias_initial_heading=True.
+        str: one of Navigate.HEADING_MODES. Defaults to 'toward_target' if
+        neither key is present.
     """
     with open(os.path.join(run_dir, 'variant.json')) as f:
         variant = json.load(f)
-    return not variant.get('no_bias_initial_heading', False)
+    if 'initial_heading_mode' in variant:
+        return variant['initial_heading_mode']
+    return 'uniform' if variant.get('no_bias_initial_heading', False) else 'toward_target'
 
 
-def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', shade_bias_off=False):
+def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', shade_heading_mode=False):
     """Plot reward (avg/min/max/current), velocity, (for navigate runs)
     distance from target, and (if run_info has curriculum_params) the
     w_speed/w_dir/w_dist curriculum weights, vs epoch.
@@ -108,10 +113,11 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
             is added if possible.
         save: if True, save the figure as an SVG named after the run folder.
         save_dir: directory to save the figure in.
-        shade_bias_off: if True, shade the epoch ranges (if any) that were
-            trained with Navigate's heading bias off (--no_bias_initial_heading),
-            looked up per-segment from each run folder's variant.json. Off by
-            default.
+        shade_heading_mode: if True, shade the epoch ranges (if any) that
+            weren't trained with the default 'toward_target' initial heading
+            mode (--initial_heading_mode), looked up per-segment from each
+            run folder's variant.json. Off by default. 'uniform' and
+            'away_from_target' are shaded in different colors.
 
     Returns:
         (fig, ax, df)
@@ -119,17 +125,19 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
     df, segments = _load_progress(csv_path)
     task = _infer_task(df)
 
-    # Figure out which epoch ranges (if any) were trained with the heading bias
-    # off, so they can be shaded -- bias_initial_heading is a per-run setting
-    # (from variant.json), not logged per-step to progress.csv, so it has to be
-    # looked up per segment from each segment's own run folder.
-    bias_off_spans = []
-    if shade_bias_off and task == 'navigate':
+    # Figure out which epoch ranges (if any) were trained with a non-default
+    # heading mode, so they can be shaded -- initial_heading_mode is a per-run
+    # setting (from variant.json), not logged per-step to progress.csv, so it
+    # has to be looked up per segment from each segment's own run folder.
+    HEADING_MODE_COLORS = {'uniform': 'red', 'away_from_target': 'blue'}
+    heading_mode_spans = {}  # mode -> list of (epoch_start, epoch_end)
+    if shade_heading_mode and task == 'navigate':
         for epoch_start, epoch_end, path in segments:
             run_dir = os.path.dirname(os.path.abspath(path))
             try:
-                if not get_bias_initial_heading(run_dir):
-                    bias_off_spans.append((epoch_start, epoch_end))
+                mode = get_initial_heading_mode(run_dir)
+                if mode != 'toward_target':
+                    heading_mode_spans.setdefault(mode, []).append((epoch_start, epoch_end))
             except (FileNotFoundError, KeyError):
                 pass
 
@@ -187,10 +195,11 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
         else:
             a.plot(df['Epoch'], df[col])
         a.set_ylabel(label)
-        for i, (epoch_start, epoch_end) in enumerate(bias_off_spans):
-            a.axvspan(epoch_start, epoch_end, color='red', alpha=0.08,
-                      label='heading bias off' if (a is ax[0] and i == 0) else None)
-    if bias_off_spans:
+        for mode, spans in heading_mode_spans.items():
+            for i, (epoch_start, epoch_end) in enumerate(spans):
+                a.axvspan(epoch_start, epoch_end, color=HEADING_MODE_COLORS[mode], alpha=0.08,
+                          label=f'heading: {mode}' if (a is ax[0] and i == 0) else None)
+    if heading_mode_spans:
         ax[0].legend(fontsize=8, loc='upper right')
     ax[-1].set_xlabel('Epoch')
 
@@ -446,11 +455,13 @@ def format_run_summary(info):
     steps_per_eval = env_spec.get('max_episode_length')
 
     curriculum = variant.get('curriculum')
-    bias_heading = not variant.get('no_bias_initial_heading', False)
+    heading_mode = (variant['initial_heading_mode'] if 'initial_heading_mode' in variant
+                     else 'uniform' if variant.get('no_bias_initial_heading', False)
+                     else 'toward_target')
     header = task
     if task == 'navigate':
         header = (f'{task} (use_task={use_task}, curriculum={curriculum}, '
-                   f'bias_initial_heading={bias_heading})')
+                   f'initial_heading={heading_mode})')
     settings = (f"epochs={variant.get('n_epochs')}  pop={variant.get('population_size')}  "
                 f"sigma={variant.get('sigma')}  lr={variant.get('lr')}  "
                 f"n_evals={n_evals}  steps/eval={steps_per_eval}")

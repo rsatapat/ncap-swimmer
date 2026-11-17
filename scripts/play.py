@@ -76,7 +76,8 @@ def load_checkpoint(path, use_best=False):
     return policy, task
 
 
-def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False):
+def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False,
+                     initial_heading_mode='toward_target'):
     """Run one episode with a fixed seed (and target, for navigate), and
     collect its trajectory, summary metrics, and (if requested) video frames.
 
@@ -91,6 +92,12 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
         target: (x, y) target position (navigate only).
         max_steps: episode length cap.
         render: if True, also render and collect an RGB frame per step.
+        initial_heading_mode: one of Navigate.HEADING_MODES -- how this
+            episode's starting heading is picked, independent of whatever
+            mode the policy was actually trained with (navigate only; this
+            function never reads the checkpoint's own training setting, so
+            it defaults to Navigate's own default, 'toward_target', unless
+            told otherwise).
 
     Returns:
         dict with seed, target, total_reward, mean_reward, mean_velocity,
@@ -103,8 +110,10 @@ def rollout_episode(policy, task, seed, target=None, max_steps=300, render=False
         arrays, only if render=True).
     """
     task_kwargs = dict(random=seed)
-    if task == 'navigate' and target is not None:
-        task_kwargs['target_pos'] = target
+    if task == 'navigate':
+        if target is not None:
+            task_kwargs['target_pos'] = target
+        task_kwargs['initial_heading_mode'] = initial_heading_mode
     env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs))
     physics = env._env.physics
 
@@ -217,7 +226,8 @@ def run_sweep(policy, task, seeds, targets, max_steps=300, out_csv=None):
     return results
 
 
-def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=None):
+def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=None,
+                     initial_heading_mode='toward_target'):
     """Roll out several itr_N.pkl checkpoints from the same run, on the same
     seed, for every (itr, target) combination, to see how the trajectory
     changes over training -- and, with more than one target, whether a
@@ -235,6 +245,9 @@ def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=
             every (itr, target) rollout (itr, target, step, x, y, velocity,
             reward, bearing, obs_distance -- the latter two are the policy's
             own to_target observation, navigate only).
+        initial_heading_mode: one of Navigate.HEADING_MODES -- this eval's
+            starting-heading mode, independent of whatever the checkpoint was
+            actually trained with (see rollout_episode).
 
     Returns:
         list of dicts, one per (itr, target) combination (see rollout_episode()).
@@ -244,7 +257,8 @@ def run_checkpoints(run_dir, itrs, targets=None, seed=1, max_steps=300, out_csv=
     for itr in itrs:
         policy, task = load_checkpoint(os.path.join(run_dir, f'itr_{itr}.pkl'))
         for target in targets:
-            result = rollout_episode(policy, task, seed=seed, target=target, max_steps=max_steps)
+            result = rollout_episode(policy, task, seed=seed, target=target, max_steps=max_steps,
+                                      initial_heading_mode=initial_heading_mode)
             result['itr'] = itr
             results.append(result)
             print(f"itr={itr} target={result['target']}: final_distance={result['final_distance']} "
@@ -306,6 +320,13 @@ if __name__ == '__main__':
                               "Defaults to just the checkpoint's own trained-on target.")
     parser.add_argument('--seed', type=int, default=1,
                          help='Random seed, shared across every (itr, target) rollout (--mode checkpoints only).')
+    parser.add_argument('--initial_heading_mode', default='toward_target',
+                         choices=['toward_target', 'uniform', 'away_from_target'],
+                         help="This eval's starting-heading mode (--mode checkpoints/sweep only, "
+                              "navigate only) -- independent of whatever mode each checkpoint was "
+                              "actually trained with, since this script never reads that setting "
+                              "from the checkpoint's own variant.json. Defaults to 'toward_target', "
+                              "Navigate's own default.")
     args = parser.parse_args()
 
     if args.mode == 'checkpoints':
@@ -314,8 +335,14 @@ if __name__ == '__main__':
         if args.targets:
             targets = [tuple(float(v) for v in pair.split(',')) for pair in args.targets.split(';')]
         itrs_tag = '-'.join(str(itr) for itr in itrs)
-        out_csv = os.path.join(args.model, f'checkpoint_trajectories_{itrs_tag}_seed{args.seed}.csv')
-        run_checkpoints(args.model, itrs, targets, seed=args.seed, max_steps=args.n_steps, out_csv=out_csv)
+        # Default mode keeps the original (un-suffixed) filename, so existing
+        # CSVs generated before this flag existed are still found/reused;
+        # only non-default eval heading modes get a distinguishing suffix, so
+        # they don't collide with (or overwrite) a different mode's results.
+        heading_tag = '' if args.initial_heading_mode == 'toward_target' else f'_heading-{args.initial_heading_mode}'
+        out_csv = os.path.join(args.model, f'checkpoint_trajectories_{itrs_tag}_seed{args.seed}{heading_tag}.csv')
+        run_checkpoints(args.model, itrs, targets, seed=args.seed, max_steps=args.n_steps, out_csv=out_csv,
+                         initial_heading_mode=args.initial_heading_mode)
     else:
         print("Loading policy and weights...")
         policy, task = load_checkpoint(args.model)
