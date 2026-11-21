@@ -43,12 +43,19 @@ def navigate(
   environment_kwargs={},
   curriculum='epoch',  # 'epoch', 'value_gated', or 'value_free' -- see Navigate.get_reward
   initial_heading_mode='toward_target',  # see Navigate.__init__
+  randomize_target_per_epoch=False,  # see Navigate.__init__
+  target_min_radius=1.0,
+  target_max_radius=4.0,
+  target_seed=0,
 ):
   """Returns the Navigate task for a n-link swimmer."""
   model_string, assets = swimmer.get_model_and_assets(n_links)
   physics = swimmer.Physics.from_xml_string(model_string, assets=assets)
   task = Navigate(target_pos=target_pos, desired_speed=desired_speed, random=random,
-                   curriculum=curriculum, initial_heading_mode=initial_heading_mode)
+                   curriculum=curriculum, initial_heading_mode=initial_heading_mode,
+                   randomize_target_per_epoch=randomize_target_per_epoch,
+                   target_min_radius=target_min_radius, target_max_radius=target_max_radius,
+                   target_seed=target_seed)
   # print(time_limit, swimmer._CONTROL_TIMESTEP)
   return control.Environment(
     physics,
@@ -107,10 +114,15 @@ class Navigate(swimmer.Swimmer):
     HEADING_MODES = ('toward_target', 'uniform', 'away_from_target')
 
     def __init__(self, target_pos=(2.0, 2.0), desired_speed=_SWIM_SPEED, random=None,
-                 curriculum='epoch', ema_alpha=0.1, initial_heading_mode='toward_target'):
+                 curriculum='epoch', ema_alpha=0.1, initial_heading_mode='toward_target',
+                 randomize_target_per_epoch=False, target_min_radius=1.0, target_max_radius=4.0,
+                 target_seed=0):
         """Initialize the task.
         Args:
             target_pos: A tuple/list of (X, Y) coordinates for the target.
+                Ignored if randomize_target_per_epoch is True (except to seed
+                the very first epoch's distance scaling before set_epoch is
+                ever called -- see randomize_target_per_epoch below).
             desired_speed: The speed at which the swimmer should move.
             random: Optional random number generator.
             curriculum: how get_reward schedules w_speed/w_dir/w_dist --
@@ -133,17 +145,46 @@ class Navigate(swimmer.Swimmer):
                   directly AWAY from the target -- the hardest-possible start,
                   for stress-testing whether a policy can recover from a full
                   U-turn rather than relying on an easy start.
+            randomize_target_per_epoch: if True, the target is resampled once
+                per epoch (not per episode) from a uniform-area annulus around
+                the swimmer's start, [target_min_radius, target_max_radius]
+                from the origin -- instead of staying fixed at target_pos for
+                the whole run. Resampled once per epoch, not per episode,
+                because ES ranks the population's candidates against each
+                other within one epoch; a different target per episode would
+                mix "this candidate is better" with "this candidate got an
+                easier target" into the same comparison. Deterministic given
+                (target_seed, epoch) -- see set_epoch -- so every MPI rank
+                (each with its own Navigate instance, and its own separate,
+                rank-specific self.random stream for heading/episode noise)
+                independently computes the identical target for a given
+                epoch, with no broadcast needed.
+            target_min_radius, target_max_radius: the annulus' inner/outer
+                radius (only used if randomize_target_per_epoch).
+            target_seed: combined with the epoch number to seed each epoch's
+                target draw (only used if randomize_target_per_epoch). Use the
+                run's base --seed (not an MPI-rank-offset one) if you want a
+                different target sequence per experiment while keeping every
+                rank of one experiment in sync; leave at the default to share
+                the same target sequence across every experiment.
         """
         assert initial_heading_mode in self.HEADING_MODES, (
             f'initial_heading_mode must be one of {self.HEADING_MODES}, got {initial_heading_mode!r}')
         super().__init__(random=random)
-        self._target_pos = np.array(target_pos)
         self._desired_speed = desired_speed
-        self.distance_to_target = np.linalg.norm(target_pos)  # Initialize distance to target
-        # Distance from the swimmer's start position (0, 0) to the target. dist_reward's
-        # bounds/margin scale off this so the reward shapes sensibly regardless of how
-        # close or far the target is.
-        self._initial_distance = np.linalg.norm(self._target_pos)
+        self.randomize_target_per_epoch = randomize_target_per_epoch
+        self.target_min_radius = target_min_radius
+        self.target_max_radius = target_max_radius
+        self.target_seed = target_seed
+        if randomize_target_per_epoch:
+            self._resample_target(epoch=0)
+        else:
+            self._target_pos = np.array(target_pos)
+            # Distance from the swimmer's start position (0, 0) to the target.
+            # dist_reward's bounds/margin scale off this so the reward shapes
+            # sensibly regardless of how close or far the target is.
+            self._initial_distance = np.linalg.norm(self._target_pos)
+        self.distance_to_target = self._initial_distance  # Initialize distance to target
         self.current_epoch = 0
 
         self.curriculum = curriculum
@@ -202,6 +243,29 @@ class Navigate(swimmer.Swimmer):
     def set_epoch(self, epoch: int):
         """Helper method to update current epoch from training loop."""
         self.current_epoch = epoch
+        if self.randomize_target_per_epoch:
+            self._resample_target(epoch)
+
+    def _resample_target(self, epoch):
+        """Draw this epoch's target uniformly (by area) from the annulus
+        [target_min_radius, target_max_radius] around the origin, and update
+        _initial_distance (== the new target's own radius) to match, so
+        dist_reward's scaling stays correct for whichever target this is.
+
+        Seeded from (target_seed, epoch) alone, not self.random -- self.random
+        is a per-MPI-rank stream (seeded per-worker, see train_swimmer_es.py),
+        so using it here would give every rank a DIFFERENT target for the
+        "same" epoch. Keying strictly off the epoch number instead means every
+        rank computes the identical target independently, with no broadcast.
+        """
+        rng = np.random.RandomState(self.target_seed + epoch)
+        angle = rng.uniform(0, 2 * np.pi)
+        # sqrt(uniform(min_r^2, max_r^2)), not uniform(min_r, max_r), so the
+        # target is uniform by AREA across the annulus (otherwise points would
+        # bunch up near the inner radius, since the annulus's area grows with r).
+        radius = np.sqrt(rng.uniform(self.target_min_radius ** 2, self.target_max_radius ** 2))
+        self._target_pos = np.array([radius * np.cos(angle), radius * np.sin(angle)])
+        self._initial_distance = radius  # == np.linalg.norm(self._target_pos), by construction
 
     def update_curriculum_ema(self, speed_reward, dir_reward, dist_reward):
         """Update the 'value_*' curricula's running averages from one clean,

@@ -77,6 +77,16 @@ import estorch
        "full circle (the dm_control base class default). 'away_from_target': biased to within "
        "+-45 degrees of facing directly away from the target -- the hardest start, forcing a "
        "genuine U-turn every episode. Only matters for --task=navigate.")
+@click.option('--randomize_target_per_epoch', is_flag=True, default=False,
+  help="Resample the navigate target once per epoch (not per episode, so ES still ranks the "
+       "population's candidates against each other on the same target within an epoch) from a "
+       "uniform-area annulus around the origin, [--target_min_radius, --target_max_radius], "
+       "instead of leaving it fixed at --target_pos for the whole run. Only matters for "
+       "--task=navigate.")
+@click.option('--target_min_radius', default=1.0, type=float,
+  help="Annulus inner radius for --randomize_target_per_epoch.")
+@click.option('--target_max_radius', default=4.0, type=float,
+  help="Annulus outer radius for --randomize_target_per_epoch.")
 @click.option('--seed', default=1, help='Random seed.')
 @wrap_experiment(
   prefix='experiments/swimmer/swimmer_es',
@@ -110,6 +120,9 @@ def swimmer_es(
   warm_start_path,
   warm_start_epoch_offset,
   initial_heading_mode,
+  randomize_target_per_epoch,
+  target_min_radius,
+  target_max_radius,
   seed,
 ):
   assert population_size % n_proc == 0 and population_size % 2 == 0
@@ -119,6 +132,7 @@ def swimmer_es(
   rank = comm.Get_rank()
   size = comm.Get_size()
 
+  base_seed = seed  # Shared across every rank -- see randomize_target_per_epoch's target_seed below.
   seed = 1000 * seed + rank  # Worker-specific seed based on task id.
   deterministic.set_seed(seed)
 
@@ -127,6 +141,12 @@ def swimmer_es(
   if task == 'navigate':
     task_kwargs['curriculum'] = curriculum
     task_kwargs['initial_heading_mode'] = initial_heading_mode
+    task_kwargs['randomize_target_per_epoch'] = randomize_target_per_epoch
+    task_kwargs['target_min_radius'] = target_min_radius
+    task_kwargs['target_max_radius'] = target_max_radius
+    # base_seed (not the rank-offset `seed`) so every rank's Navigate instance
+    # independently resamples the IDENTICAL target for a given epoch.
+    task_kwargs['target_seed'] = base_seed
 
   env = DMControlEnv(suite.load('swimmer', task, task_kwargs=task_kwargs)) #this loads the task from envs.py
 
@@ -210,8 +230,10 @@ def swimmer_es(
         # timestep of the episode (which would measure typical distance while
         # swimming, not navigation accuracy).
         if 'to_target' in data['env_infos']:
-          final_to_target = data['env_infos']['to_target'][-1]
-          all_target_distances.append(np.linalg.norm(final_to_target))
+          # to_target is [bearing, distance], not [x, y] -- take the distance
+          # component directly, not its norm with the bearing angle.
+          final_distance = data['env_infos']['to_target'][-1][1]
+          all_target_distances.append(final_distance)
 
         # Mean speed within this episode, one value per episode (like
         # all_target_distances above), so a longer episode doesn't get more

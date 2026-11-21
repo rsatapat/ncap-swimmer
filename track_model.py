@@ -63,6 +63,24 @@ def _load_progress(csv_path):
     return df, [(df['Epoch'].min(), df['Epoch'].max(), csv_path)]
 
 
+def get_distance_fix(run_dir):
+    """Read distance_fix.csv (written by scripts/fix_distance_metric.py), if
+    present -- the corrected DistanceFromTarget at each saved checkpoint,
+    re-rolled from the actual policy weights to undo the
+    bearing/distance-mixup bug in old progress.csv logs (see that script's
+    docstring).
+
+    Returns:
+        (itrs, distances) as parallel lists, or (None, None) if no
+        distance_fix.csv exists in run_dir.
+    """
+    path = os.path.join(run_dir, 'distance_fix.csv')
+    if not os.path.isfile(path):
+        return None, None
+    fix_df = pd.read_csv(path)
+    return fix_df['itr'].tolist(), fix_df['distance'].tolist()
+
+
 def get_initial_heading_mode(run_dir):
     """Read which initial-heading mode a run was trained with, from its
     variant.json. Understands both the current 3-way --initial_heading_mode
@@ -141,6 +159,24 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
             except (FileNotFoundError, KeyError):
                 pass
 
+    # Corrected DistanceFromTarget points (if scripts/fix_distance_metric.py
+    # has been run for this run's folders) -- old progress.csv rows mix
+    # bearing into the distance (see that script's docstring), so these
+    # re-rolled checkpoint values are the only trustworthy distance data for
+    # runs logged before the bug was fixed. Each segment's own itr numbers
+    # are local, so they need that segment's epoch offset added back, same
+    # as the Epoch column above.
+    corrected_epochs, corrected_distances = [], []
+    if task == 'navigate':
+        for epoch_start, epoch_end, path in segments:
+            run_dir = os.path.dirname(os.path.abspath(path))
+            itrs, distances = get_distance_fix(run_dir)
+            if itrs is None:
+                continue
+            offset = epoch_start - 1 if epoch_start > 1 else 0
+            corrected_epochs.extend(itr + offset for itr in itrs)
+            corrected_distances.extend(distances)
+
     # (column, y-label) for each subplot, top to bottom
     panels = [('PopulationAvgReturn', 'Reward')]
     if task == 'navigate':
@@ -193,7 +229,12 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
             a.set_ylim(-0.05, 1.05)
             a.legend(fontsize=8, loc='upper left')
         else:
-            a.plot(df['Epoch'], df[col])
+            a.plot(df['Epoch'], df[col], label='logged (uncorrected)' if corrected_epochs else None)
+            if col == 'DistanceFromTarget' and corrected_epochs:
+                order = np.argsort(corrected_epochs)
+                a.plot(np.array(corrected_epochs)[order], np.array(corrected_distances)[order],
+                       'o-', color='green', markersize=3, label='corrected (checkpoint re-eval)')
+                a.legend(fontsize=8, loc='upper left')
         a.set_ylabel(label)
         for mode, spans in heading_mode_spans.items():
             for i, (epoch_start, epoch_end) in enumerate(spans):
@@ -464,7 +505,8 @@ def format_run_summary(info):
                    f'initial_heading={heading_mode})')
     settings = (f"epochs={variant.get('n_epochs')}  pop={variant.get('population_size')}  "
                 f"sigma={variant.get('sigma')}  lr={variant.get('lr')}  "
-                f"n_evals={n_evals}  steps/eval={steps_per_eval}")
+                f"n_evals={n_evals}  steps/eval={steps_per_eval}  "
+                f"ncap_opts={variant.get('ncap_opts')}")
 
     lines = [header, settings]
 
