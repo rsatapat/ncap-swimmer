@@ -70,11 +70,11 @@ import estorch
        "the checkpoint's itr_N filename/progress.csv. Needed when --warm_start_path itself points "
        "into a run that was already a warm-started continuation: that run's own itr_N is a local "
        "step count, not the true cumulative epoch.")
-@click.option('--initial_heading_mode', default='toward_target',
+@click.option('--initial_heading_mode', default='uniform',
   type=click.Choice(['toward_target', 'uniform', 'away_from_target']),
-  help="How each navigate episode's starting heading is picked. 'toward_target' (default): "
-       "biased to within +-45 degrees of facing the target. 'uniform': uniform random over the "
-       "full circle (the dm_control base class default). 'away_from_target': biased to within "
+  help="How each navigate episode's starting heading is picked. 'uniform' (default): uniform "
+       "random over the full circle (the dm_control base class default). 'toward_target': "
+       "biased to within +-45 degrees of facing the target. 'away_from_target': biased to within "
        "+-45 degrees of facing directly away from the target -- the hardest start, forcing a "
        "genuine U-turn every episode. Only matters for --task=navigate.")
 @click.option('--randomize_target_per_epoch', is_flag=True, default=False,

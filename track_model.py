@@ -229,8 +229,11 @@ def plot_training_progress(csv_path, run_info=None, save=True, save_dir='.', sha
             a.set_ylim(-0.05, 1.05)
             a.legend(fontsize=8, loc='upper left')
         else:
-            a.plot(df['Epoch'], df[col], label='logged (uncorrected)' if corrected_epochs else None)
-            if col == 'DistanceFromTarget' and corrected_epochs:
+            has_fix = col == 'DistanceFromTarget' and corrected_epochs
+            a.plot(df['Epoch'], df[col], color='gray' if has_fix else None,
+                   alpha=0.25 if has_fix else 1.0,
+                   label='logged (uncorrected)' if has_fix else None)
+            if has_fix:
                 order = np.argsort(corrected_epochs)
                 a.plot(np.array(corrected_epochs)[order], np.array(corrected_distances)[order],
                        'o-', color='green', markersize=3, label='corrected (checkpoint re-eval)')
